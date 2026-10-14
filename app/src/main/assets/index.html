@@ -115,6 +115,7 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <input type="password" id="key" placeholder="AIza... を貼り付け">
       <div class="hint">Google AI Studio（aistudio.google.com）で無料で作れます。キーはこのスマホの中にだけ保存されます。未設定でも、タイマー・アラーム・アプリ起動・メモ・時刻は使えます。</div>
     </div>
+    <button class="btn ghost" id="testConn">頭脳との接続をテスト</button>
     <div class="field">
       <label for="model">頭脳のモデル名</label>
       <input type="text" id="model" placeholder="gemini-flash-latest">
@@ -345,7 +346,13 @@ async function callGemini(body, onRetry){
 }
 function geminiError(r){
   if (r.error === "NO_KEY") return "頭脳のAPIキーがまだ設定されていません。右上の設定から登録してください。";
-  if (r.status === 0) return "インターネットにつながらないようです。電波を確認してください。";
+  if (r.status === 0){
+    const e = String(r.error || "");
+    if (/UnknownHost|ConnectException|NoRoute|Network is unreachable/i.test(e)) return "インターネットにつながらないようです。電波を確認してください。";
+    if (/Timeout/i.test(e)) return "頭脳の返事が遅すぎて、時間切れになりました。もう一度どうぞ。";
+    if (/SSL|Handshake|Certificate/i.test(e)) return "安全な接続を確立できませんでした。スマホの日付と時刻が正しいか確認してください。（詳細: " + e.slice(0,120) + "）";
+    return "頭脳との通信で問題が起きました。（詳細: " + (e || "不明").slice(0,160) + "）";
+  }
   let msg = ""; try{ msg = JSON.parse(r.body).error.message || ""; }catch(e){}
   if (r.status === 429) return "無料枠の上限に達したようです。少し時間をおいてから、もう一度どうぞ。";
   if (r.status === 400 && /API key/i.test(msg)) return "APIキーが正しくないようです。設定を確認してください。";
@@ -468,6 +475,19 @@ $("#conv").onclick = e => e.currentTarget.classList.toggle("on");
 $("#rate").oninput = $("#pitch").oninput = syncRange;
 $("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(`お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。`); };
 sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(false); });
+$("#testConn").onclick = async () => {
+  const b = $("#testConn"); if (b.disabled) return;
+  A.setPref("gemini_key", $("#key").value.trim());
+  A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
+  b.disabled = true; b.textContent = "テスト中…";
+  const model = pref("gemini_model", "gemini-flash-latest");
+  const r = await callGeminiOnce(model, { contents:[{ role:"user", parts:[{ text:"「接続OK」とだけ返事して" }] }] });
+  b.disabled = false; b.textContent = "頭脳との接続をテスト";
+  if (r.status === 200) add("sys", `接続OK（${model}）`);
+  else { let detail = r.error || ""; try{ detail = JSON.parse(r.body).error.message; }catch(e){}
+    add("sys", `接続テスト失敗：${r.status} ${String(detail).slice(0,200)}\n${geminiError(r)}`); }
+  sheet.hidden = true;
+};
 
 /* ===== リング ===== */
 const cv = $("#ring"), cx = cv.getContext("2d");

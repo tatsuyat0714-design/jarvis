@@ -255,7 +255,7 @@ public class MainActivity extends Activity {
                 HttpURLConnection c = (HttpURLConnection) url.openConnection();
                 c.setRequestMethod("POST");
                 c.setConnectTimeout(15000);
-                c.setReadTimeout(60000);
+                c.setReadTimeout(90000);
                 c.setDoOutput(true);
                 c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                 c.setRequestProperty("x-goog-api-key", key);
@@ -271,7 +271,8 @@ public class MainActivity extends Activity {
                 try {
                     JSONObject wrap = new JSONObject();
                     wrap.put("status", 0);
-                    wrap.put("error", String.valueOf(e.getMessage()));
+                    wrap.put("error", "NO_KEY".equals(e.getMessage()) ? "NO_KEY"
+                            : e.getClass().getSimpleName() + ": " + e.getMessage());
                     result = wrap.toString();
                 } catch (Exception ignored) { result = "{\"status\":0}"; }
             }
