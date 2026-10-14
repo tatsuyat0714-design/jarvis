@@ -1,0 +1,41 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.tatsuya.jarvis'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.tatsuya.jarvis'
+        minSdk 26
+        targetSdk 34
+        versionCode((System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger())
+        versionName "0.1.${System.getenv('GITHUB_RUN_NUMBER') ?: '0'}"
+    }
+
+    signingConfigs {
+        // 固定の署名キー：毎回同じキーで署名するので、上書きアップデートができる
+        jarvis {
+            storeFile file('jarvis.keystore')
+            storePassword 'jarvis123'
+            keyAlias 'jarvis'
+            keyPassword 'jarvis123'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.jarvis
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.jarvis
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

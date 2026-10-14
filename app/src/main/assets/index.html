@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ジャービス</title>
+<style>
+:root{
+  --ink:#070b10; --panel:#0d151d; --panel2:#111c26; --line:#1d2c38;
+  --ice:#8fd8ff; --ice-dim:#4a7d99; --amber:#ffb454; --red:#ff6b6b;
+  --fg:#dbe7ee; --muted:#7f95a3;
+  --f-display:"Rajdhani","Roboto Condensed","Roboto",sans-serif;
+  --f-body:"Noto Sans JP","Noto Sans CJK JP","Roboto",sans-serif;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{background:var(--ink);color:var(--fg);font-family:var(--f-body);font-size:15px;overflow:hidden;user-select:none}
+.app{height:100%;display:flex;flex-direction:column;padding:12px 16px 14px;gap:10px;max-width:640px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between}
+.brand{font-family:var(--f-display);font-weight:700;letter-spacing:.32em;font-size:16px;color:var(--ice)}
+.brand small{display:block;font-weight:400;letter-spacing:.18em;font-size:10px;color:var(--muted);margin-top:2px}
+.icon-btn{background:transparent;border:1px solid var(--line);color:var(--muted);border-radius:999px;height:36px;padding:0 14px;font:500 13px var(--f-body)}
+.icon-btn.on{color:var(--ice);border-color:var(--ice-dim)}
+.hb{display:flex;gap:8px}
+
+.core{position:relative;display:grid;place-items:center;flex:0 0 auto}
+#ring{width:min(56vw,240px);height:min(56vw,240px)}
+.state{position:absolute;bottom:0;left:0;right:0;text-align:center;font-family:var(--f-display);font-size:12px;letter-spacing:.3em;color:var(--ice-dim)}
+
+.log{flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding:6px 2px;user-select:text;
+  -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 18px)}
+.msg{max-width:88%;line-height:1.7;white-space:pre-wrap;word-break:break-word}
+.msg.you{align-self:flex-end;background:var(--panel);border:1px solid var(--line);padding:8px 12px;border-radius:14px 14px 4px 14px}
+.msg.j{align-self:flex-start;padding-left:12px;border-left:2px solid var(--ice-dim)}
+.msg.j .who{font-family:var(--f-display);font-size:10px;letter-spacing:.25em;color:var(--ice-dim);display:block;margin-bottom:2px}
+.msg.sys{align-self:center;font-size:12px;color:var(--muted);text-align:center}
+.msg.act{align-self:flex-start;font-size:12px;color:var(--amber);font-family:var(--f-display);letter-spacing:.08em}
+.msg.thinking span:last-child{color:var(--muted)}
+
+.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:999px;padding:8px 13px;font:500 13px var(--f-body)}
+.chip:active{border-color:var(--ice-dim)}
+
+.bar{display:flex;gap:10px;align-items:center}
+form{flex:1;display:flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 4px 4px 14px;min-width:0}
+#q{flex:1;min-width:0;background:transparent;border:0;color:var(--fg);font:16px var(--f-body);padding:9px 0;outline:none}
+#q::placeholder{color:var(--muted)}
+#send{width:38px;height:38px;border-radius:50%;border:0;background:var(--panel2);color:var(--ice);display:grid;place-items:center}
+#mic{flex:0 0 auto;width:62px;height:62px;border-radius:50%;border:0;background:var(--ice);color:var(--ink);display:grid;place-items:center;box-shadow:0 0 0 0 rgba(143,216,255,.5);transition:box-shadow .15s}
+#mic.on{background:var(--amber);box-shadow:0 0 0 8px rgba(255,180,84,.18)}
+svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#mic svg.i{width:28px;height:28px}
+
+/* 設定 */
+.sheet{position:fixed;inset:0;background:rgba(3,6,9,.7);display:flex;align-items:flex-end;z-index:10}
+.sheet[hidden]{display:none}
+.sheet .in{width:100%;max-height:92%;overflow-y:auto;background:var(--panel);border-top:1px solid var(--line);border-radius:18px 18px 0 0;padding:18px 18px 26px;display:flex;flex-direction:column;gap:16px;user-select:text}
+.sheet h2{margin:0;font:700 16px var(--f-body);letter-spacing:.05em}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:12px;color:var(--muted);letter-spacing:.05em}
+.field input[type=text],.field input[type=password]{background:var(--ink);border:1px solid var(--line);border-radius:10px;color:var(--fg);font:15px var(--f-body);padding:11px 12px;outline:none}
+.field input:focus{border-color:var(--ice-dim)}
+.field .hint{font-size:12px;color:var(--muted);line-height:1.6}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+input[type=range]{width:100%;accent-color:var(--ice)}
+.toggle{width:52px;height:30px;border-radius:999px;background:var(--line);border:0;position:relative;flex:0 0 auto}
+.toggle::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:var(--muted);transition:left .15s}
+.toggle.on{background:var(--ice-dim)}
+.toggle.on::after{left:25px;background:var(--ice)}
+.btn{background:var(--ice);color:var(--ink);border:0;border-radius:12px;padding:13px;font:700 15px var(--f-body)}
+.btn.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+.btns{display:flex;gap:10px}.btns .btn{flex:1}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">JARVIS<small>PERSONAL ASSISTANT</small></div>
+    <div class="hb">
+      <button class="icon-btn" id="memoBtn">メモ</button>
+      <button class="icon-btn" id="setBtn">設定</button>
+    </div>
+  </header>
+
+  <div class="core">
+    <canvas id="ring" width="480" height="480"></canvas>
+    <div class="state" id="state">STANDBY</div>
+  </div>
+
+  <div class="log" id="log"></div>
+
+  <div class="chips" id="chips">
+    <button class="chip">今何時？</button>
+    <button class="chip">3分タイマー</button>
+    <button class="chip">明日7時に起こして</button>
+    <button class="chip">YouTubeを開いて</button>
+    <button class="chip">メモを読んで</button>
+  </div>
+
+  <div class="bar">
+    <form id="f" autocomplete="off">
+      <input id="q" placeholder="文字で話しかける…" enterkeyhint="send">
+      <button id="send" type="submit" aria-label="送信"><svg class="i" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+    </form>
+    <button id="mic" aria-label="話しかける"><svg class="i" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+  </div>
+</div>
+
+<div class="sheet" id="sheet" hidden>
+  <div class="in">
+    <h2>設定</h2>
+    <div class="field">
+      <label for="key">頭脳（Gemini）のAPIキー</label>
+      <input type="password" id="key" placeholder="AIza... を貼り付け">
+      <div class="hint">Google AI Studio（aistudio.google.com）で無料で作れます。キーはこのスマホの中にだけ保存されます。未設定でも、タイマー・アラーム・アプリ起動・メモ・時刻は使えます。</div>
+    </div>
+    <div class="field">
+      <label for="model">頭脳のモデル名</label>
+      <input type="text" id="model" placeholder="gemini-flash-latest">
+      <div class="hint">ふだんは変更不要です。うまく動かないときだけ変えます。</div>
+    </div>
+    <div class="field">
+      <div class="row"><label>話す速さ</label><span id="rateV"></span></div>
+      <input type="range" id="rate" min="0.6" max="1.6" step="0.05">
+    </div>
+    <div class="field">
+      <div class="row"><label>声の高さ</label><span id="pitchV"></span></div>
+      <input type="range" id="pitch" min="0.5" max="1.5" step="0.05">
+    </div>
+    <div class="row">
+      <div class="field" style="flex:1"><label>会話モード</label><div class="hint">ジャービスが話し終わったら、自動で次の言葉を聞き取ります。「ありがとう」で終了。</div></div>
+      <button class="toggle" id="conv" aria-label="会話モード"></button>
+    </div>
+    <div class="field">
+      <label for="callme">あなたの呼び方</label>
+      <input type="text" id="callme" placeholder="ボス">
+    </div>
+    <div class="btns">
+      <button class="btn ghost" id="testVoice">声をテスト</button>
+      <button class="btn" id="saveSet">保存して閉じる</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== スマホ機能への橋（PCのブラウザで開いたとき用の代役つき） ===== */
+const A = window.Android || {
+  speak(t){ try{ const u=new SpeechSynthesisUtterance(t); u.lang="ja-JP"; u.onstart=()=>jarvis.onSpeak("start"); u.onend=()=>jarvis.onSpeak("end"); speechSynthesis.speak(u);}catch(e){ jarvis.onSpeak("end"); } },
+  stopSpeak(){ try{ speechSynthesis.cancel(); }catch(e){} },
+  setVoice(){}, listen(){ jarvis.onListenError("unavailable"); }, stopListen(){},
+  setTimer(){ return false; }, setAlarm(){ return false; }, openApp(){ return ""; }, listApps(){ return "[]"; },
+  gemini(id){ setTimeout(()=>jarvis.onGemini(id, JSON.stringify({status:0,error:"NO_BRIDGE"})), 10); },
+  getPref(k){ try{ return localStorage.getItem("j."+k)||""; }catch(e){ return ""; } },
+  setPref(k,v){ try{ localStorage.setItem("j."+k,v); }catch(e){} },
+  exitApp(){}
+};
+
+const $ = s => document.querySelector(s);
+const log = $("#log"), q = $("#q"), stateEl = $("#state"), micBtn = $("#mic");
+
+/* ===== 設定・保存 ===== */
+const pref = (k, d) => { const v = A.getPref(k); return v === "" || v == null ? d : v; };
+const cfg = {
+  get callme(){ return pref("callme", "ボス"); },
+  get conv(){ return pref("conv", "0") === "1"; },
+  get hasKey(){ return !!pref("gemini_key", ""); },
+};
+let memos = []; try{ memos = JSON.parse(pref("memos", "[]")); }catch(e){ memos = []; }
+const saveMemos = () => A.setPref("memos", JSON.stringify(memos));
+
+/* ===== 画面 ===== */
+let mode = "idle";
+function setMode(m){ mode = m; stateEl.textContent = {idle:"STANDBY",listening:"LISTENING",thinking:"ANALYZING",speaking:"SPEAKING"}[m]; micBtn.classList.toggle("on", m==="listening"); }
+function add(cls, text){
+  const d = document.createElement("div"); d.className = "msg " + cls;
+  if (cls.startsWith("j")){ const w=document.createElement("span"); w.className="who"; w.textContent="JARVIS"; d.append(w); }
+  const t = document.createElement("span"); t.textContent = text; d.append(t);
+  log.append(d); while (log.children.length > 80) log.firstChild.remove();
+  log.scrollTop = log.scrollHeight; return t;
+}
+
+/* ===== 話す ===== */
+let viaVoice = false, endConv = false;
+function say(text){
+  add("j", text);
+  const clean = text.replace(/[*#`_>|~]/g, "").replace(/\n+/g, "。");
+  A.speak(clean);
+}
+
+/* ===== 時刻・数字 ===== */
+const now = () => new Date();
+const fmtDate = d => `${d.getMonth()+1}月${d.getDate()}日 ${"日月火水木金土"[d.getDay()]}曜日`;
+const fmtTime = d => { const h=d.getHours(), m=d.getMinutes(); return `${h<12?"午前":"午後"}${h%12===0?12:h%12}時${m?m+"分":"ちょうど"}`; };
+function kanjiNum(s){
+  const map={〇:0,零:0,一:1,二:2,三:3,四:4,五:5,六:6,七:7,八:8,九:9};
+  s = s.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0)-0xFEE0));
+  return s.replace(/(?:[一二三四五六七八九]?十[一二三四五六七八九]?|[〇零一二三四五六七八九])(?=時|分|秒|番)/g, m => {
+    if (m.includes("十")){ const [a,b]=m.split("十"); return String((a?map[a]:1)*10 + (b?map[b]:0)); }
+    return String(map[m]);
+  });
+}
+
+/* ===== 実際の操作（AIからもローカル命令からも使う） ===== */
+const actions = {
+  get_datetime(){ const d=now(); return { date: fmtDate(d), time: fmtTime(d) }; },
+  set_timer({seconds, label}){
+    seconds = Math.round(Number(seconds));
+    if (!(seconds > 0 && seconds <= 86400)) return { ok:false, error:"時間が正しくありません" };
+    const ok = A.setTimer(seconds, String(label||"ジャービス"));
+    if (ok) add("act", `⏱ タイマー ${seconds>=60?Math.floor(seconds/60)+"分":""}${seconds%60?seconds%60+"秒":""} 開始`);
+    return { ok };
+  },
+  set_alarm({hour, minute, label}){
+    hour = Number(hour); minute = Number(minute||0);
+    if (!(hour>=0 && hour<24 && minute>=0 && minute<60)) return { ok:false, error:"時刻が正しくありません" };
+    const ok = A.setAlarm(hour, minute, String(label||"ジャービス"));
+    if (ok) add("act", `⏰ アラーム ${hour}:${String(minute).padStart(2,"0")} 登録`);
+    return { ok };
+  },
+  open_app({name}){
+    const opened = A.openApp(String(name||""));
+    if (opened) add("act", `▶ ${opened} を起動`);
+    return opened ? { ok:true, opened } : { ok:false, error:"そのアプリが見つかりません" };
+  },
+  add_memo({text}){
+    text = String(text||"").trim().slice(0,200); if(!text) return { ok:false };
+    memos.push({ text, at: Date.now() }); saveMemos(); add("act", `✎ メモ追加：${text}`);
+    return { ok:true, count: memos.length };
+  },
+  list_memos(){ return { memos: memos.map((m,i)=>({ n:i+1, text:m.text })) }; },
+  delete_memo({n}){
+    n = Number(n); if (!(n>=1 && n<=memos.length)) return { ok:false, error:"その番号のメモはありません" };
+    const [r] = memos.splice(n-1,1); saveMemos(); add("act", `✕ メモ削除：${r.text}`);
+    return { ok:true, deleted:r.text };
+  },
+};
+
+/* ===== ローカル命令（無料・オフラインで即実行） ===== */
+let pendingClear = false;
+function local(raw){
+  const t = kanjiNum(raw.replace(/\s+/g,"")).replace(/[。、！!？?]+$/,"");
+  const B = cfg.callme;
+
+  if (pendingClear){
+    pendingClear = false;
+    if (/^(はい|うん|お願い|消して|いいよ|OK|ok)/.test(t)){ memos = []; saveMemos(); return `メモをすべて消去しました、${B}。`; }
+    return "了解しました。メモはそのまま残しておきます。";
+  }
+  if (/^(ストップ|止めて|とめて|黙って|だまって|静かに)$/.test(t)){ A.stopSpeak(); return null; }
+  if (/^(ありがとう|ありがと|サンキュー|おわり|終わり|終了|もういい|大丈夫)/.test(t)){ endConv = true; return `どういたしまして、${B}。いつでもお呼びください。`; }
+
+  // タイマー
+  if (/タイマー|計って|はかって/.test(t) && /\d+\s*(時間|分|秒)/.test(t)){
+    let s = 0; let m;
+    if (m = t.match(/(\d+)時間(半)?/)) s += m[1]*3600 + (m[2]?1800:0);
+    if (m = t.match(/(\d+)分(半)?/)) s += m[1]*60 + (m[2]?30:0);
+    if (m = t.match(/(\d+)秒/)) s += +m[1];
+    const r = actions.set_timer({ seconds:s, label:"ジャービス" });
+    if (!r.ok) return "タイマーを設定できませんでした。時計アプリを確認してください。";
+    const parts = []; if (s>=3600) parts.push(Math.floor(s/3600)+"時間"); if (s%3600>=60) parts.push(Math.floor(s%3600/60)+"分"); if (s%60) parts.push(s%60+"秒");
+    return `${parts.join("")}のタイマーを開始しました、${B}。`;
+  }
+
+  // アラーム
+  if (/アラーム|起こして|おこして|目覚まし/.test(t)){
+    let m = t.match(/(午前|午後|朝|夜|夕方|昼)?(\d{1,2})(?:時|:)(?:(\d{1,2})分?|(半))?/);
+    if (m){
+      let h = +m[2], mi = m[4] ? 30 : (m[3] ? +m[3] : 0);
+      if (/午後|夜|夕方/.test(m[1]||"") && h < 12) h += 12;
+      if (m[1]==="昼" && h < 6) h += 12;
+      const r = actions.set_alarm({ hour:h, minute:mi });
+      if (!r.ok) return "アラームを設定できませんでした。時計アプリを確認してください。";
+      return `${h}時${mi?mi+"分":""}にアラームをセットしました。おまかせください、${B}。`;
+    }
+  }
+
+  // 時刻・日付
+  if (/(何時|なんじ|いまなんじ)(?!間)|今の時間|時刻/.test(t)) return `現在、${fmtTime(now())}です。`;
+  if (/何日|何曜|なんにち|なんようび|日付/.test(t)) return `今日は${fmtDate(now())}です。`;
+
+  // メモ
+  if (/メモ/.test(t)){
+    if (/(全部|ぜんぶ|すべて|全て).*(消|削除)/.test(t)){ if(!memos.length) return "メモはもともと空です。"; pendingClear = true; return `メモ${memos.length}件をすべて消してよろしいですか？`; }
+    let m = t.match(/(\d+)番?.*(消|削除)/);
+    if (m){ const r = actions.delete_memo({ n:+m[1] }); return r.ok ? `「${r.deleted}」を削除しました。` : "その番号のメモは見つかりません。"; }
+    if (/(読|よ|見|み|教|おし|一覧|確認|ある)/.test(t) && !/(を|って|と)メモして?$/.test(t)){
+      if (!memos.length) return "メモは今のところありません。";
+      return `メモは${memos.length}件です。` + memos.map((x,i)=>`${i+1}、${x.text}`).join("。") + "。";
+    }
+    m = t.match(/^「?(.+?)」?(?:って|と|を)?メモ(?:して|っといて|しといて|しておいて|お願い)?$/);
+    if (m && m[1] && !/^(メモ|これ)$/.test(m[1])){ actions.add_memo({ text:m[1] }); return `「${m[1]}」をメモしました。`; }
+  }
+
+  // アプリ起動
+  let m = t.match(/^(.+?)(?:を|の)?(?:アプリ)?(?:を)?(開いて|ひらいて|起動して|起動|立ち上げて|つけて|開けて|開く|開け)(?:ください|くれ)?$/);
+  if (m){
+    const name = m[1].replace(/(アプリ|の)$/,"");
+    const r = actions.open_app({ name });
+    return r.ok ? `${r.opened}を開きます。` : `「${name}」というアプリが見つかりませんでした。`;
+  }
+  return undefined; // ローカルでは処理できない → AIへ
+}
+
+/* ===== AI（Gemini） ===== */
+const history = []; // Gemini の contents
+let reqSeq = 0; const waiting = {};
+const tools = [{ functionDeclarations: [
+  { name:"get_datetime", description:"現在の日付・曜日・時刻を取得する" },
+  { name:"set_timer", description:"スマホの時計アプリでカウントダウンタイマーを開始する", parameters:{ type:"object", properties:{ seconds:{type:"integer",description:"秒数"}, label:{type:"string",description:"タイマー名"} }, required:["seconds"] } },
+  { name:"set_alarm", description:"スマホの時計アプリにアラームを登録する（24時間制）", parameters:{ type:"object", properties:{ hour:{type:"integer"}, minute:{type:"integer"}, label:{type:"string"} }, required:["hour","minute"] } },
+  { name:"open_app", description:"インストール済みのアプリを名前で起動する", parameters:{ type:"object", properties:{ name:{type:"string",description:"アプリ名（例: YouTube, LINE, カメラ）"} }, required:["name"] } },
+  { name:"add_memo", description:"メモ・やることを保存する", parameters:{ type:"object", properties:{ text:{type:"string"} }, required:["text"] } },
+  { name:"list_memos", description:"保存されたメモを番号付きで取得する" },
+  { name:"delete_memo", description:"番号を指定してメモを1件削除する", parameters:{ type:"object", properties:{ n:{type:"integer"} }, required:["n"] } },
+]}];
+const system = () => `あなたは「ジャービス」。ユーザー専属の、有能で落ち着いた執事型AIアシスタントで、ユーザーのAndroidスマホの中で動いている。
+- ユーザーを「${cfg.callme}」と呼び、丁寧だが少しウィットのある日本語で話す。
+- 返答は音声で読み上げられる。原則1〜3文で簡潔に。マークダウン、箇条書き、絵文字、記号は使わない。
+- タイマー、アラーム、アプリ起動、メモ、時刻の依頼は、必ず用意された関数を使って実行してから結果を短く伝える。
+- 送金、購入、メッセージ送信など、関数にない操作は「まだできません」と正直に伝える。
+- 最新ニュースや天気など、知らない可能性のある情報は推測で断言しない。
+- 現在: ${fmtDate(now())} ${fmtTime(now())}`;
+
+function callGemini(body){
+  return new Promise(res => { const id = "g" + (++reqSeq); waiting[id] = res; A.gemini(id, JSON.stringify(body)); });
+}
+function geminiError(r){
+  if (r.error === "NO_KEY") return "頭脳のAPIキーがまだ設定されていません。右上の設定から登録してください。";
+  if (r.status === 0) return "インターネットにつながらないようです。電波を確認してください。";
+  let msg = ""; try{ msg = JSON.parse(r.body).error.message || ""; }catch(e){}
+  if (r.status === 429) return "無料枠の上限に達したようです。少し時間をおいてから、もう一度どうぞ。";
+  if (r.status === 400 && /API key/i.test(msg)) return "APIキーが正しくないようです。設定を確認してください。";
+  if (r.status === 404) return "頭脳のモデル名が見つかりません。設定のモデル名を確認してください。";
+  if (r.status === 403) return "このAPIキーでは使えないようです。設定を確認してください。";
+  return `頭脳との通信でエラーが起きました（${r.status}）。`;
+}
+async function askAI(text){
+  while (history.length > 20 || (history.length && history[0].role !== "user") || (history[0] && history[0].parts.some(p=>p.functionResponse))) history.shift();
+  const startLen = history.length;
+  history.push({ role:"user", parts:[{ text }] });
+  const bubble = add("j thinking", "考え中…");
+  setMode("thinking");
+  for (let round = 0; round < 4; round++){
+    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } });
+    if (r.status !== 200){
+      bubble.parentElement.remove(); history.length = startLen;
+      return geminiError(r);
+    }
+    let data; try{ data = JSON.parse(r.body); }catch(e){ bubble.parentElement.remove(); history.length = startLen; return "頭脳からの返事が読み取れませんでした。"; }
+    const content = data.candidates && data.candidates[0] && data.candidates[0].content;
+    const parts = (content && content.parts) || [];
+    const calls = parts.filter(p => p.functionCall);
+    if (calls.length){
+      history.push(content);
+      const responses = calls.map(c => {
+        const fn = actions[c.functionCall.name];
+        let result; try{ result = fn ? fn(c.functionCall.args || {}) : { error:"unknown function" }; }catch(e){ result = { error:String(e) }; }
+        return { functionResponse:{ name:c.functionCall.name, response:{ result } } };
+      });
+      history.push({ role:"user", parts: responses });
+      continue;
+    }
+    const answer = parts.filter(p => p.text && !p.thought).map(p => p.text).join("").trim();
+    bubble.parentElement.remove();
+    if (!answer){ history.length = startLen; return "申し訳ありません、うまく答えがまとまりませんでした。"; }
+    history.push({ role:"model", parts:[{ text: answer }] });
+    return answer;
+  }
+  bubble.parentElement.remove(); history.length = startLen;
+  return "手順が込み入ってしまいました。もう少し簡単に言い直していただけますか。";
+}
+
+/* ===== 入力を処理 ===== */
+let busy = false;
+async function handle(text, voice){
+  text = (text||"").trim(); if (!text || busy) return;
+  viaVoice = !!voice; endConv = false;
+  A.stopSpeak();
+  add("you", text); q.value = "";
+  const r = local(text);
+  if (r === null){ setMode("idle"); return; }
+  if (r !== undefined){ say(r); return; }
+  if (!cfg.hasKey){
+    say(/こんにちは|こんばんは|おはよう/.test(text) ? `${/おはよう/.test(text)?"おはようございます":/こんばんは/.test(text)?"こんばんは":"こんにちは"}、${cfg.callme}。ご用件をどうぞ。`
+      : "その件にお答えするには頭脳のAPIキーが必要です。右上の設定から登録してください。タイマー、アラーム、アプリ起動、メモなら今すぐできます。");
+    return;
+  }
+  busy = true;
+  try{ say(await askAI(text)); } finally { busy = false; }
+}
+
+/* ===== Java からの呼び出し口 ===== */
+window.jarvis = {
+  onSpeak(s){
+    if (s === "start") setMode("speaking");
+    else { if (mode === "speaking") setMode("idle");
+      if (s === "end" && viaVoice && cfg.conv && !endConv && !busy) setTimeout(() => { if (mode === "idle") startListen(); }, 350);
+    }
+  },
+  onListen(s){ if (s === "ready") setMode("listening"); if (s === "end" && mode === "listening") setMode("thinking"); },
+  onLevel(v){ level = Math.max(0, Math.min(1, (v + 2) / 12)); },
+  onPartial(t){ q.value = t; },
+  onHeard(t){ q.value = ""; setMode("idle"); if (t) handle(t, true); },
+  onListenError(code){
+    setMode("idle"); q.value = "";
+    const msg = { permission:"マイクの使用が許可されていません。スマホの設定から、ジャービスにマイクを許可してください。",
+      unavailable:"このスマホでは音声認識が使えないようです。Googleアプリが入っているか確認してください。" }[code];
+    if (msg) add("sys", msg);
+    // 7=聞き取れず 6=無音タイムアウト → 静かに待機に戻る
+  },
+  onGemini(id, json){ const f = waiting[id]; delete waiting[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (f) f(r); },
+  onAssist(){ startListen(); },
+  onBack(){ if (!$("#sheet").hidden){ closeSheet(false); } else A.exitApp(); },
+};
+
+function startListen(){ if (mode === "listening"){ A.stopListen(); return; } A.stopSpeak(); setMode("listening"); A.listen(); }
+micBtn.onclick = startListen;
+$("#f").addEventListener("submit", e => { e.preventDefault(); handle(q.value, false); });
+$("#chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) handle(b.textContent, false); });
+$("#memoBtn").onclick = () => add("sys", memos.length ? "メモ一覧\n" + memos.map((m,i)=>`${i+1}. ${m.text}`).join("\n") : "メモはまだありません");
+
+/* ===== 設定シート ===== */
+const sheet = $("#sheet");
+function openSheet(){
+  $("#key").value = pref("gemini_key",""); $("#model").value = pref("gemini_model","");
+  $("#rate").value = pref("rate_v","1.05"); $("#pitch").value = pref("pitch_v","0.9");
+  $("#callme").value = pref("callme","");
+  $("#conv").classList.toggle("on", cfg.conv);
+  syncRange(); sheet.hidden = false;
+}
+function syncRange(){ $("#rateV").textContent = Number($("#rate").value).toFixed(2); $("#pitchV").textContent = Number($("#pitch").value).toFixed(2); }
+function closeSheet(save){
+  if (save){
+    A.setPref("gemini_key", $("#key").value.trim());
+    A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
+    A.setPref("rate_v", $("#rate").value); A.setPref("pitch_v", $("#pitch").value);
+    A.setVoice(Number($("#rate").value), Number($("#pitch").value));
+    A.setPref("callme", $("#callme").value.trim());
+    A.setPref("conv", $("#conv").classList.contains("on") ? "1" : "0");
+    add("sys", "設定を保存しました");
+  }
+  sheet.hidden = true;
+}
+$("#setBtn").onclick = openSheet;
+$("#saveSet").onclick = () => closeSheet(true);
+$("#conv").onclick = e => e.currentTarget.classList.toggle("on");
+$("#rate").oninput = $("#pitch").oninput = syncRange;
+$("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(`お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。`); };
+sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(false); });
+
+/* ===== リング ===== */
+const cv = $("#ring"), cx = cv.getContext("2d");
+let energy = 0, level = 0, t0 = performance.now();
+function draw(nowT){
+  const t = (nowT - t0)/1000, W = cv.width, C = W/2;
+  const target = { idle:.15, listening:.55 + level*.45, thinking:.85, speaking:1 }[mode];
+  energy += (target - energy) * 0.08;
+  cx.clearRect(0,0,W,W);
+  const pulse = mode === "speaking" ? (Math.sin(t*14)+Math.sin(t*9.3))*0.25+0.5 : mode === "listening" ? level : 0;
+  const speed = 0.15 + energy*1.2;
+  const g = cx.createRadialGradient(C,C,0,C,C,W*.3);
+  g.addColorStop(0, mode==="listening" ? `rgba(255,180,84,${.3+pulse*.4})` : `rgba(143,216,255,${.35+energy*.35+pulse*.2})`);
+  g.addColorStop(1, "rgba(143,216,255,0)");
+  cx.fillStyle = g; cx.beginPath(); cx.arc(C,C,W*.3,0,Math.PI*2); cx.fill();
+  cx.lineCap = "round";
+  cx.strokeStyle = `rgba(143,216,255,${.7+pulse*.3})`; cx.lineWidth = 3;
+  cx.beginPath(); cx.arc(C,C,W*(.13+pulse*.02),0,Math.PI*2); cx.stroke();
+  [{r:.22,n:3,gap:.5,w:10,dir:1,sp:1},{r:.30,n:24,gap:.45,w:6,dir:-1,sp:.6},{r:.38,n:5,gap:.35,w:3,dir:1,sp:.35},{r:.45,n:72,gap:.6,w:3,dir:-1,sp:.15}]
+  .forEach((R,k) => {
+    const seg = Math.PI*2/R.n, rot = t*speed*R.sp*R.dir;
+    cx.lineWidth = R.w;
+    cx.strokeStyle = k===3 ? "rgba(74,125,153,.8)" : `rgba(143,216,255,${.35+energy*.5})`;
+    for (let i=0;i<R.n;i++){ const a = rot + i*seg; cx.beginPath(); cx.arc(C,C,W*R.r,a,a+seg*(1-R.gap)); cx.stroke(); }
+  });
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+/* ===== 起動時 ===== */
+(function boot(){
+  const h = now().getHours();
+  const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
+  add("j", `${greet}、${cfg.callme}。下のマイクボタンを押して話しかけてください。`);
+  if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiのAPIキーを登録してください。");
+  A.setVoice(Number(pref("rate_v","1.05")), Number(pref("pitch_v","0.9")));
+})();
+</script>
+</body>
+</html>
