@@ -242,12 +242,13 @@ public class MainActivity extends Activity {
 
     // ---------------- 通信（Gemini） ----------------
 
-    private void geminiRequest(final String id, final String body) {
+    private void geminiRequest(final String id, final String modelOverride, final String body) {
         new Thread(() -> {
             String result;
             try {
                 String key = prefs.getString("gemini_key", "");
-                String model = prefs.getString("gemini_model", "gemini-flash-latest");
+                String model = (modelOverride != null && !modelOverride.isEmpty())
+                        ? modelOverride : prefs.getString("gemini_model", "gemini-flash-latest");
                 if (key.isEmpty()) throw new Exception("NO_KEY");
                 URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models/"
                         + URLEncoder.encode(model, "UTF-8") + ":generateContent");
@@ -361,7 +362,7 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void gemini(String id, String body) { geminiRequest(id, body); }
+        public void gemini(String id, String model, String body) { geminiRequest(id, model, body); }
 
         @JavascriptInterface
         public String getPref(String k) { return prefs.getString(k, ""); }

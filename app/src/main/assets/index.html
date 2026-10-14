@@ -322,8 +322,26 @@ const system = () => `あなたは「ジャービス」。ユーザー専属の�
 - 最新ニュースや天気など、知らない可能性のある情報は推測で断言しない。
 - 現在: ${fmtDate(now())} ${fmtTime(now())}`;
 
-function callGemini(body){
-  return new Promise(res => { const id = "g" + (++reqSeq); waiting[id] = res; A.gemini(id, JSON.stringify(body)); });
+function callGeminiOnce(model, body){
+  return new Promise(res => { const id = "g" + (++reqSeq); waiting[id] = res; A.gemini(id, model, JSON.stringify(body)); });
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* 混雑(503/500)や一時制限(429)のときは、少し待って再挑戦 → 別の軽いモデルに切り替え */
+async function callGemini(body, onRetry){
+  const main = pref("gemini_model", "gemini-flash-latest");
+  const plan = [main, main, "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    .filter((m, i, a) => i === 1 || a.indexOf(m) === i);
+  let last;
+  for (let i = 0; i < plan.length; i++){
+    if (i > 0){ onRetry && onRetry(i); await sleep(i === 1 ? 1500 : 600); }
+    last = await callGeminiOnce(plan[i], body);
+    if (last.status === 200) return last;
+    const transient = last.status === 503 || last.status === 500 || last.status === 502 || last.status === 504;
+    const quota = last.status === 429;
+    const missing = last.status === 404 && i >= 2; // 予備モデルが存在しなければ次へ
+    if (!(transient || quota || missing)) return last;
+  }
+  return last;
 }
 function geminiError(r){
   if (r.error === "NO_KEY") return "頭脳のAPIキーがまだ設定されていません。右上の設定から登録してください。";
@@ -333,6 +351,7 @@ function geminiError(r){
   if (r.status === 400 && /API key/i.test(msg)) return "APIキーが正しくないようです。設定を確認してください。";
   if (r.status === 404) return "頭脳のモデル名が見つかりません。設定のモデル名を確認してください。";
   if (r.status === 403) return "このAPIキーでは使えないようです。設定を確認してください。";
+  if (r.status >= 500) return "Google側の頭脳が混み合っているようです。少し時間をおいて、もう一度どうぞ。";
   return `頭脳との通信でエラーが起きました（${r.status}）。`;
 }
 async function askAI(text){
@@ -342,7 +361,8 @@ async function askAI(text){
   const bubble = add("j thinking", "考え中…");
   setMode("thinking");
   for (let round = 0; round < 4; round++){
-    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } });
+    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } },
+      n => { bubble.textContent = n === 1 ? "混雑中…再接続しています" : "別の回線に切り替えています…"; });
     if (r.status !== 200){
       bubble.parentElement.remove(); history.length = startLen;
       return geminiError(r);
