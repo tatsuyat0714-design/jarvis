@@ -242,23 +242,31 @@ public class MainActivity extends Activity {
 
     // ---------------- 通信（Gemini） ----------------
 
-    private void geminiRequest(final String id, final String modelOverride, final String body) {
+    /** provider: "gemini" または "groq" */
+    private void aiRequest(final String id, final String provider, final String modelOverride, final String body) {
         new Thread(() -> {
             String result;
             try {
-                String key = prefs.getString("gemini_key", "");
-                String model = (modelOverride != null && !modelOverride.isEmpty())
-                        ? modelOverride : prefs.getString("gemini_model", "gemini-flash-latest");
+                boolean groq = "groq".equals(provider);
+                String key = prefs.getString(groq ? "groq_key" : "gemini_key", "");
                 if (key.isEmpty()) throw new Exception("NO_KEY");
-                URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models/"
-                        + URLEncoder.encode(model, "UTF-8") + ":generateContent");
+                URL url;
+                if (groq) {
+                    url = new URL("https://api.groq.com/openai/v1/chat/completions");
+                } else {
+                    String model = (modelOverride != null && !modelOverride.isEmpty())
+                            ? modelOverride : prefs.getString("gemini_model", "gemini-flash-latest");
+                    url = new URL("https://generativelanguage.googleapis.com/v1beta/models/"
+                            + URLEncoder.encode(model, "UTF-8") + ":generateContent");
+                }
                 HttpURLConnection c = (HttpURLConnection) url.openConnection();
                 c.setRequestMethod("POST");
                 c.setConnectTimeout(15000);
                 c.setReadTimeout(90000);
                 c.setDoOutput(true);
                 c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-                c.setRequestProperty("x-goog-api-key", key);
+                if (groq) c.setRequestProperty("Authorization", "Bearer " + key);
+                else c.setRequestProperty("x-goog-api-key", key);
                 try (OutputStream os = c.getOutputStream()) { os.write(body.getBytes(StandardCharsets.UTF_8)); }
                 int code = c.getResponseCode();
                 InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
@@ -363,7 +371,10 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public void gemini(String id, String model, String body) { geminiRequest(id, model, body); }
+        public void gemini(String id, String model, String body) { aiRequest(id, "gemini", model, body); }
+
+        @JavascriptInterface
+        public void groq(String id, String body) { aiRequest(id, "groq", "", body); }
 
         @JavascriptInterface
         public String getPref(String k) { return prefs.getString(k, ""); }

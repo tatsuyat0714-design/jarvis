@@ -115,9 +115,18 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <input type="password" id="key" placeholder="AIza... を貼り付け">
       <div class="hint">Google AI Studio（aistudio.google.com）で無料で作れます。キーはこのスマホの中にだけ保存されます。未設定でも、タイマー・アラーム・アプリ起動・メモ・時刻は使えます。</div>
     </div>
+    <div class="field">
+      <label for="gkey">予備の頭脳（Groq）のAPIキー</label>
+      <input type="password" id="gkey" placeholder="gsk_... を貼り付け">
+      <div class="hint">console.groq.com で無料で作れます。Geminiが混んでいるとき、自動でこちらに切り替えます。</div>
+    </div>
+    <div class="row">
+      <div class="field" style="flex:1"><label>Groqを優先して使う</label><div class="hint">オンにすると、ふだんからGroqで答え、混雑時にGeminiへ切り替えます。</div></div>
+      <button class="toggle" id="gfirst" aria-label="Groqを優先"></button>
+    </div>
     <button class="btn ghost" id="testConn">頭脳との接続をテスト</button>
     <div class="field">
-      <label for="model">頭脳のモデル名</label>
+      <label for="model">Geminiのモデル名</label>
       <input type="text" id="model" placeholder="gemini-flash-latest">
       <div class="hint">ふだんは変更不要です。うまく動かないときだけ変えます。</div>
     </div>
@@ -165,7 +174,7 @@ const pref = (k, d) => { const v = A.getPref(k); return v === "" || v == null ? 
 const cfg = {
   get callme(){ return pref("callme", "ボス"); },
   get conv(){ return pref("conv", "0") === "1"; },
-  get hasKey(){ return !!pref("gemini_key", ""); },
+  get hasKey(){ return !!pref("gemini_key", "") || !!pref("groq_key", ""); },
 };
 let memos = []; try{ memos = JSON.parse(pref("memos", "[]")); }catch(e){ memos = []; }
 const saveMemos = () => A.setPref("memos", JSON.stringify(memos));
@@ -303,7 +312,7 @@ function local(raw){
   return undefined; // ローカルでは処理できない → AIへ
 }
 
-/* ===== AI（Gemini） ===== */
+/* ===== AI（Gemini ＋ 予備のGroq） ===== */
 const history = []; // Gemini の contents
 let reqSeq = 0; const waiting = {};
 const tools = [{ functionDeclarations: [
@@ -323,29 +332,94 @@ const system = () => `あなたは「ジャービス」。ユーザー専属の�
 - 最新ニュースや天気など、知らない可能性のある情報は推測で断言しない。
 - 現在: ${fmtDate(now())} ${fmtTime(now())}`;
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 function callGeminiOnce(model, body){
   return new Promise(res => { const id = "g" + (++reqSeq); waiting[id] = res; A.gemini(id, model, JSON.stringify(body)); });
 }
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-/* 混雑(503/500)や一時制限(429)のときは、少し待って再挑戦 → 別の軽いモデルに切り替え */
+function callGroqOnce(body){
+  return new Promise(res => { const id = "q" + (++reqSeq); waiting[id] = res;
+    if (A.groq) A.groq(id, JSON.stringify(body)); else setTimeout(() => jarvis.onGemini(id, JSON.stringify({ status:0, error:"NO_BRIDGE" })), 10); });
+}
+const hasGemini = () => !!pref("gemini_key", "");
+const hasGroq = () => !!pref("groq_key", "");
+const groqFirst = () => pref("groq_first", "0") === "1";
+const isBusy = r => r.status === 429 || r.status >= 500 || (r.status === 0 && /Timeout/i.test(String(r.error||"")));
+
+/* Gemini：混雑なら再挑戦 → 軽いモデルへ。Groqが控えているときは粘らずすぐ交代 */
 async function callGemini(body, onRetry){
   const main = pref("gemini_model", "gemini-flash-latest");
-  const plan = [main, main, "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
-    .filter((m, i, a) => i === 1 || a.indexOf(m) === i);
+  const plan = hasGroq() ? [main, "gemini-2.5-flash-lite"]
+    : [main, main, "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
+  const uniq = plan.filter((m, i, a) => (i === 1 && !hasGroq()) || a.indexOf(m) === i);
   let last;
-  for (let i = 0; i < plan.length; i++){
-    if (i > 0){ onRetry && onRetry(i); await sleep(i === 1 ? 1500 : 600); }
-    last = await callGeminiOnce(plan[i], body);
+  for (let i = 0; i < uniq.length; i++){
+    if (i > 0){ onRetry && onRetry("gemini", i); await sleep(i === 1 && !hasGroq() ? 1500 : 400); }
+    last = await callGeminiOnce(uniq[i], body);
     if (last.status === 200) return last;
-    const transient = last.status === 503 || last.status === 500 || last.status === 502 || last.status === 504;
-    const quota = last.status === 429;
-    const missing = last.status === 404 && i >= 2; // 予備モデルが存在しなければ次へ
-    if (!(transient || quota || missing)) return last;
+    if (!(isBusy(last) || (last.status === 404 && i >= 1))) return last;
   }
   return last;
 }
-function geminiError(r){
+
+/* ===== Gemini形式の会話履歴 → Groq（OpenAI形式）に変換 ===== */
+const groqTools = tools[0].functionDeclarations.map(f => ({ type:"function", function:{ name:f.name, description:f.description, parameters: f.parameters || { type:"object", properties:{} } } }));
+function toOpenAI(hist){
+  const out = [{ role:"system", content: system() }]; let k = 0; let pending = [];
+  for (const c of hist){
+    const calls = c.parts.filter(p => p.functionCall), resps = c.parts.filter(p => p.functionResponse);
+    const text = c.parts.filter(p => p.text && !p.thought).map(p => p.text).join("");
+    if (c.role === "model"){
+      if (calls.length){
+        pending = calls.map(() => "call_" + (++k));
+        out.push({ role:"assistant", content: text || null, tool_calls: calls.map((p, i) => ({ id: pending[i], type:"function", function:{ name:p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) } })) });
+      } else out.push({ role:"assistant", content: text });
+    } else if (resps.length){
+      resps.forEach((p, i) => out.push({ role:"tool", tool_call_id: pending[i] || ("call_" + (++k)), content: JSON.stringify(p.functionResponse.response) }));
+      pending = [];
+    } else out.push({ role:"user", content: text });
+  }
+  return out;
+}
+
+/* 1往復ぶん頭脳に聞く。どちらの会社の返事も同じ形 {calls, content, text} にそろえる */
+async function oneRound(state, onRetry){
+  const tryGroq = async () => {
+    const r = await callGroqOnce({ model: pref("groq_model", "openai/gpt-oss-120b"), messages: toOpenAI(history), tools: groqTools, temperature: 0.7, reasoning_effort: "low" });
+    if (r.status !== 200) return { error: r, provider:"groq" };
+    let d; try{ d = JSON.parse(r.body); }catch(e){ return { error:{ status:-1 }, provider:"groq" }; }
+    const m = (d.choices && d.choices[0] && d.choices[0].message) || {};
+    const calls = (m.tool_calls || []).map(t => { let args = {}; try{ args = JSON.parse(t.function.arguments || "{}"); }catch(e){} return { name:t.function.name, args }; });
+    const content = { role:"model", parts: calls.length ? calls.map(c => ({ functionCall:{ name:c.name, args:c.args } })) : [{ text: m.content || "" }] };
+    return { calls, content, text: (m.content || "").trim() };
+  };
+  const tryGemini = async () => {
+    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } }, onRetry);
+    if (r.status !== 200) return { error: r, provider:"gemini" };
+    let d; try{ d = JSON.parse(r.body); }catch(e){ return { error:{ status:-1 }, provider:"gemini" }; }
+    const content = d.candidates && d.candidates[0] && d.candidates[0].content;
+    const parts = (content && content.parts) || [];
+    const calls = parts.filter(p => p.functionCall).map(p => ({ name:p.functionCall.name, args:p.functionCall.args || {} }));
+    return { calls, content, text: parts.filter(p => p.text && !p.thought).map(p => p.text).join("").trim() };
+  };
+  // この会話ターンで一度Groqに切り替えたら、最後までGroqで
+  if (state.provider !== "groq" && hasGemini() && !(groqFirst() && hasGroq())){
+    const g = await tryGemini();
+    if (!g.error || !hasGroq() || !(isBusy(g.error) || g.error.status === 404)) return g;
+    state.provider = "groq"; onRetry && onRetry("groq");
+    return tryGroq();
+  }
+  if (hasGroq()){
+    state.provider = "groq";
+    const q = await tryGroq();
+    if (q.error && hasGemini() && isBusy(q.error)){ state.provider = "gemini"; onRetry && onRetry("gemini-back"); return tryGemini(); }
+    return q;
+  }
+  return tryGemini();
+}
+
+function aiError(r, provider){
   if (r.error === "NO_KEY") return "頭脳のAPIキーがまだ設定されていません。右上の設定から登録してください。";
+  if (r.status === -1) return "頭脳からの返事が読み取れませんでした。";
   if (r.status === 0){
     const e = String(r.error || "");
     if (/UnknownHost|ConnectException|NoRoute|Network is unreachable/i.test(e)) return "インターネットにつながらないようです。電波を確認してください。";
@@ -353,46 +427,43 @@ function geminiError(r){
     if (/SSL|Handshake|Certificate/i.test(e)) return "安全な接続を確立できませんでした。スマホの日付と時刻が正しいか確認してください。（詳細: " + e.slice(0,120) + "）";
     return "頭脳との通信で問題が起きました。（詳細: " + (e || "不明").slice(0,160) + "）";
   }
+  const who = provider === "groq" ? "Groq" : "Gemini";
   let msg = ""; try{ msg = JSON.parse(r.body).error.message || ""; }catch(e){}
-  if (r.status === 429) return "無料枠の上限に達したようです。少し時間をおいてから、もう一度どうぞ。";
-  if (r.status === 400 && /API key/i.test(msg)) return "APIキーが正しくないようです。設定を確認してください。";
-  if (r.status === 404) return "頭脳のモデル名が見つかりません。設定のモデル名を確認してください。";
-  if (r.status === 403) return "このAPIキーでは使えないようです。設定を確認してください。";
-  if (r.status >= 500) return "Google側の頭脳が混み合っているようです。少し時間をおいて、もう一度どうぞ。";
-  return `頭脳との通信でエラーが起きました（${r.status}）。`;
+  if (r.status === 429) return `${who}の無料枠の上限に達したようです。少し時間をおいてから、もう一度どうぞ。`;
+  if (r.status === 401 || (r.status === 400 && /API key/i.test(msg))) return `${who}のAPIキーが正しくないようです。設定を確認してください。`;
+  if (r.status === 404) return `${who}のモデル名が見つかりません。設定のモデル名を確認してください。`;
+  if (r.status === 403) return `${who}のAPIキーでは使えないようです。設定を確認してください。`;
+  if (r.status >= 500) return hasGroq() ? "GeminiもGroqも混み合っているようです。少し時間をおいて、もう一度どうぞ。"
+    : "Googleの頭脳が混み合っています。設定で予備の頭脳（Groq）のキーを登録すると、混雑時に自動で切り替えられます。";
+  return `${who}との通信でエラーが起きました（${r.status}）。${msg ? "詳細: " + msg.slice(0,120) : ""}`;
 }
+const geminiError = r => aiError(r, "gemini");
+
 async function askAI(text){
   while (history.length > 20 || (history.length && history[0].role !== "user") || (history[0] && history[0].parts.some(p=>p.functionResponse))) history.shift();
   const startLen = history.length;
   history.push({ role:"user", parts:[{ text }] });
   const bubble = add("j thinking", "考え中…");
   setMode("thinking");
+  const state = { provider: null };
+  const onRetry = (what, n) => { bubble.textContent = what === "groq" ? "混雑中…予備の頭脳（Groq）に切り替えます" : n === 1 ? "混雑中…再接続しています" : "別の回線に切り替えています…"; };
   for (let round = 0; round < 4; round++){
-    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } },
-      n => { bubble.textContent = n === 1 ? "混雑中…再接続しています" : "別の回線に切り替えています…"; });
-    if (r.status !== 200){
-      bubble.parentElement.remove(); history.length = startLen;
-      return geminiError(r);
-    }
-    let data; try{ data = JSON.parse(r.body); }catch(e){ bubble.parentElement.remove(); history.length = startLen; return "頭脳からの返事が読み取れませんでした。"; }
-    const content = data.candidates && data.candidates[0] && data.candidates[0].content;
-    const parts = (content && content.parts) || [];
-    const calls = parts.filter(p => p.functionCall);
-    if (calls.length){
-      history.push(content);
-      const responses = calls.map(c => {
-        const fn = actions[c.functionCall.name];
-        let result; try{ result = fn ? fn(c.functionCall.args || {}) : { error:"unknown function" }; }catch(e){ result = { error:String(e) }; }
-        return { functionResponse:{ name:c.functionCall.name, response:{ result } } };
+    const r = await oneRound(state, onRetry);
+    if (r.error){ bubble.parentElement.remove(); history.length = startLen; return aiError(r.error, r.provider); }
+    if (r.calls.length){
+      history.push(r.content);
+      const responses = r.calls.map(c => {
+        const fn = actions[c.name];
+        let result; try{ result = fn ? fn(c.args || {}) : { error:"unknown function" }; }catch(e){ result = { error:String(e) }; }
+        return { functionResponse:{ name:c.name, response:{ result } } };
       });
       history.push({ role:"user", parts: responses });
       continue;
     }
-    const answer = parts.filter(p => p.text && !p.thought).map(p => p.text).join("").trim();
     bubble.parentElement.remove();
-    if (!answer){ history.length = startLen; return "申し訳ありません、うまく答えがまとまりませんでした。"; }
-    history.push({ role:"model", parts:[{ text: answer }] });
-    return answer;
+    if (!r.text){ history.length = startLen; return "申し訳ありません、うまく答えがまとまりませんでした。"; }
+    history.push({ role:"model", parts:[{ text: r.text }] });
+    return r.text;
   }
   bubble.parentElement.remove(); history.length = startLen;
   return "手順が込み入ってしまいました。もう少し簡単に言い直していただけますか。";
@@ -451,16 +522,23 @@ $("#memoBtn").onclick = () => add("sys", memos.length ? "メモ一覧\n" + memos
 const sheet = $("#sheet");
 function openSheet(){
   $("#key").value = pref("gemini_key",""); $("#model").value = pref("gemini_model","");
+  $("#gkey").value = pref("groq_key","");
   $("#rate").value = pref("rate_v","1.05"); $("#pitch").value = pref("pitch_v","0.9");
   $("#callme").value = pref("callme","");
   $("#conv").classList.toggle("on", cfg.conv);
+  $("#gfirst").classList.toggle("on", groqFirst());
   syncRange(); sheet.hidden = false;
 }
 function syncRange(){ $("#rateV").textContent = Number($("#rate").value).toFixed(2); $("#pitchV").textContent = Number($("#pitch").value).toFixed(2); }
+function saveKeys(){
+  A.setPref("gemini_key", $("#key").value.trim());
+  A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
+  A.setPref("groq_key", $("#gkey").value.trim());
+  A.setPref("groq_first", $("#gfirst").classList.contains("on") ? "1" : "0");
+}
 function closeSheet(save){
   if (save){
-    A.setPref("gemini_key", $("#key").value.trim());
-    A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
+    saveKeys();
     A.setPref("rate_v", $("#rate").value); A.setPref("pitch_v", $("#pitch").value);
     A.setVoice(Number($("#rate").value), Number($("#pitch").value));
     A.setPref("callme", $("#callme").value.trim());
@@ -472,20 +550,28 @@ function closeSheet(save){
 $("#setBtn").onclick = openSheet;
 $("#saveSet").onclick = () => closeSheet(true);
 $("#conv").onclick = e => e.currentTarget.classList.toggle("on");
+$("#gfirst").onclick = e => e.currentTarget.classList.toggle("on");
 $("#rate").oninput = $("#pitch").oninput = syncRange;
 $("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(`お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。`); };
 sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(false); });
 $("#testConn").onclick = async () => {
   const b = $("#testConn"); if (b.disabled) return;
-  A.setPref("gemini_key", $("#key").value.trim());
-  A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
+  saveKeys();
   b.disabled = true; b.textContent = "テスト中…";
-  const model = pref("gemini_model", "gemini-flash-latest");
-  const r = await callGeminiOnce(model, { contents:[{ role:"user", parts:[{ text:"「接続OK」とだけ返事して" }] }] });
+  const detailOf = r => { let d = r.error || ""; try{ d = JSON.parse(r.body).error.message; }catch(e){} return String(d).slice(0,160); };
+  const lines = [];
+  if (hasGemini()){
+    const model = pref("gemini_model", "gemini-flash-latest");
+    const r = await callGeminiOnce(model, { contents:[{ role:"user", parts:[{ text:"「接続OK」とだけ返事して" }] }] });
+    lines.push(r.status === 200 ? `Gemini：接続OK（${model}）` : `Gemini：失敗 ${r.status} ${detailOf(r)}\n→ ${aiError(r,"gemini")}`);
+  } else lines.push("Gemini：キー未設定");
+  if (hasGroq()){
+    const model = pref("groq_model", "openai/gpt-oss-120b");
+    const r = await callGroqOnce({ model, messages:[{ role:"user", content:"「接続OK」とだけ返事して" }], reasoning_effort:"low" });
+    lines.push(r.status === 200 ? `Groq：接続OK（${model}）` : `Groq：失敗 ${r.status} ${detailOf(r)}\n→ ${aiError(r,"groq")}`);
+  } else lines.push("Groq：キー未設定");
   b.disabled = false; b.textContent = "頭脳との接続をテスト";
-  if (r.status === 200) add("sys", `接続OK（${model}）`);
-  else { let detail = r.error || ""; try{ detail = JSON.parse(r.body).error.message; }catch(e){}
-    add("sys", `接続テスト失敗：${r.status} ${String(detail).slice(0,200)}\n${geminiError(r)}`); }
+  add("sys", lines.join("\n"));
   sheet.hidden = true;
 };
 
@@ -522,7 +608,7 @@ requestAnimationFrame(draw);
   const h = now().getHours();
   const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
   add("j", `${greet}、${cfg.callme}。下のマイクボタンを押して話しかけてください。`);
-  if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiのAPIキーを登録してください。");
+  if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiかGroqのAPIキーを登録してください。");
   A.setVoice(Number(pref("rate_v","1.05")), Number(pref("pitch_v","0.9")));
 })();
 </script>
