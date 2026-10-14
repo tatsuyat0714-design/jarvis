@@ -7,12 +7,20 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.database.Cursor;
 import android.graphics.Color;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.media.AudioManager;
+import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.AlarmClock;
+import android.provider.CalendarContract;
+import android.provider.ContactsContract;
+import android.speech.tts.Voice;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
@@ -39,6 +47,7 @@ import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * ジャービス本体。
@@ -49,6 +58,7 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final int REQ_MIC = 1;
+    private static final int REQ_CONTACTS = 2;
 
     private WebView web;
     private TextToSpeech tts;
@@ -84,8 +94,9 @@ public class MainActivity extends Activity {
             if (status == TextToSpeech.SUCCESS) {
                 int r = tts.setLanguage(Locale.JAPAN);
                 ttsReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED;
-                tts.setPitch(prefs.getFloat("pitch", 0.9f));
-                tts.setSpeechRate(prefs.getFloat("rate", 1.05f));
+                applyVoiceName(prefs.getString("voice_name", ""));
+                tts.setPitch(prefs.getFloat("pitch", 0.85f));
+                tts.setSpeechRate(prefs.getFloat("rate", 1.0f));
                 tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                     @Override public void onStart(String id) { js("jarvis.onSpeak('start')"); }
                     @Override public void onDone(String id) { js("jarvis.onSpeak('end')"); }
@@ -174,6 +185,10 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
+        if (code == REQ_CONTACTS) {
+            boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+            js("jarvis.onContactsPermission(" + ok + ")");
+        }
         if (code == REQ_MIC) {
             boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
             if (ok && pendingListen) startListening();
@@ -238,6 +253,82 @@ public class MainActivity extends Activity {
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(launch);
         return best.loadLabel(pm).toString();
+    }
+
+    // ---------------- 声の種類 ----------------
+
+    private boolean applyVoiceName(String name) {
+        if (tts == null || name == null || name.isEmpty()) return false;
+        try {
+            Set<Voice> vs = tts.getVoices();
+            if (vs == null) return false;
+            for (Voice v : vs) {
+                if (v.getName().equals(name)) { tts.setVoice(v); return true; }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    // ---------------- 連絡先 ----------------
+
+    /** 名前で連絡先を探す → {表示名, 電話番号}。番号そのものならそのまま返す */
+    private String[] resolveContact(String who) throws Exception {
+        String digits = who.replaceAll("[^0-9+]", "");
+        if (digits.length() >= 3 && digits.length() >= who.replaceAll("[\\s-]", "").length() - 1) {
+            return new String[]{digits, digits};
+        }
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            main.post(() -> requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTS));
+            throw new Exception("PERMISSION");
+        }
+        Uri uri = Uri.withAppendedPath(ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI, Uri.encode(who));
+        try (Cursor c = getContentResolver().query(uri,
+                new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER},
+                null, null, null)) {
+            if (c != null && c.moveToFirst()) return new String[]{c.getString(0), c.getString(1)};
+        }
+        return null;
+    }
+
+    private String result(boolean ok, String key, String value) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("ok", ok);
+            if (key != null) o.put(key, value);
+            return o.toString();
+        } catch (Exception e) { return "{\"ok\":" + ok + "}"; }
+    }
+
+    private boolean startSafely(Intent i) {
+        try {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            return true;
+        } catch (Exception e) { return false; }
+    }
+
+    // ---------------- ふつうのWeb取得（天気・ニュース・Wikipedia） ----------------
+
+    private void httpGet(final String id, final String urlStr) {
+        new Thread(() -> {
+            String out;
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
+                c.setConnectTimeout(12000);
+                c.setReadTimeout(20000);
+                c.setRequestProperty("User-Agent", "JarvisPersonalAssistant/0.2 (Android; personal use)");
+                c.setRequestProperty("Accept-Language", "ja");
+                int code = c.getResponseCode();
+                String text = readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());
+                JSONObject o = new JSONObject();
+                o.put("status", code);
+                o.put("body", text);
+                out = o.toString();
+            } catch (Exception e) {
+                out = "{\"status\":0,\"error\":" + q(e.getClass().getSimpleName() + ": " + e.getMessage()) + "}";
+            }
+            js("jarvis.onGemini(" + q(id) + "," + q(out) + ")");
+        }).start();
     }
 
     // ---------------- 通信（Gemini） ----------------
@@ -384,5 +475,138 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void exitApp() { main.post(() -> moveTaskToBack(true)); }
+
+        // ----- 声 -----
+        @JavascriptInterface
+        public String listVoices() {
+            JSONArray a = new JSONArray();
+            try {
+                Set<Voice> vs = tts == null ? null : tts.getVoices();
+                if (vs != null) for (Voice v : vs) {
+                    Locale l = v.getLocale();
+                    if (l == null || !"ja".equals(l.getLanguage())) continue;
+                    JSONObject o = new JSONObject();
+                    o.put("name", v.getName());
+                    o.put("network", v.isNetworkConnectionRequired());
+                    o.put("quality", v.getQuality());
+                    a.put(o);
+                }
+            } catch (Exception ignored) {}
+            return a.toString();
+        }
+
+        @JavascriptInterface
+        public void setVoiceName(String name) {
+            prefs.edit().putString("voice_name", name).apply();
+            main.post(() -> {
+                if (name == null || name.isEmpty()) { if (tts != null) tts.setLanguage(Locale.JAPAN); }
+                else applyVoiceName(name);
+            });
+        }
+
+        // ----- スマホ本体 -----
+        @JavascriptInterface
+        public boolean torch(boolean on) {
+            try {
+                CameraManager cm = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+                for (String id : cm.getCameraIdList()) {
+                    Boolean f = cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                    if (Boolean.TRUE.equals(f)) { cm.setTorchMode(id, on); return true; }
+                }
+            } catch (Exception ignored) {}
+            return false;
+        }
+
+        /** action: up / down / mute / unmute / max / set(percent) / vibrate / normal。戻り値は現在の音量% */
+        @JavascriptInterface
+        public int volume(String action, int percent) {
+            try {
+                AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                int s = AudioManager.STREAM_MUSIC, max = am.getStreamMaxVolume(s);
+                switch (action) {
+                    case "up": am.adjustStreamVolume(s, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+                        am.adjustStreamVolume(s, AudioManager.ADJUST_RAISE, 0); break;
+                    case "down": am.adjustStreamVolume(s, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+                        am.adjustStreamVolume(s, AudioManager.ADJUST_LOWER, 0); break;
+                    case "mute": am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, AudioManager.FLAG_SHOW_UI); break;
+                    case "unmute": am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, AudioManager.FLAG_SHOW_UI); break;
+                    case "max": am.setStreamVolume(s, max, AudioManager.FLAG_SHOW_UI); break;
+                    case "set": am.setStreamVolume(s, Math.round(max * Math.max(0, Math.min(100, percent)) / 100f), AudioManager.FLAG_SHOW_UI); break;
+                    case "vibrate": am.setRingerMode(AudioManager.RINGER_MODE_VIBRATE); break;
+                    case "normal": am.setRingerMode(AudioManager.RINGER_MODE_NORMAL); break;
+                    default: break;
+                }
+                return Math.round(100f * am.getStreamVolume(s) / max);
+            } catch (Exception e) { return -1; }
+        }
+
+        @JavascriptInterface
+        public String battery() {
+            try {
+                BatteryManager bm = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
+                JSONObject o = new JSONObject();
+                o.put("level", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY));
+                o.put("charging", bm.isCharging());
+                return o.toString();
+            } catch (Exception e) { return "{}"; }
+        }
+
+        /** 電話アプリを番号入りで開く（発信ボタンは本人が押す） */
+        @JavascriptInterface
+        public String dial(String who) {
+            try {
+                String[] c = resolveContact(who);
+                if (c == null) return result(false, "error", "NOT_FOUND");
+                boolean ok = startSafely(new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(c[1]))));
+                return result(ok, "name", c[0]);
+            } catch (Exception e) { return result(false, "error", e.getMessage()); }
+        }
+
+        /** SMSを下書き状態で開く（送信ボタンは本人が押す） */
+        @JavascriptInterface
+        public String sms(String who, String body) {
+            try {
+                String[] c = resolveContact(who);
+                if (c == null) return result(false, "error", "NOT_FOUND");
+                Intent i = new Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(c[1])));
+                i.putExtra("sms_body", body);
+                return result(startSafely(i), "name", c[0]);
+            } catch (Exception e) { return result(false, "error", e.getMessage()); }
+        }
+
+        /** 文章を共有（app="line" ならLINEの送り先選択画面へ） */
+        @JavascriptInterface
+        public boolean share(String text, String app) {
+            Intent i = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text);
+            if ("line".equals(app)) {
+                i.setPackage("jp.naver.line.android");
+                if (startSafely(i)) return true;
+                i.setPackage(null);
+            }
+            return startSafely(Intent.createChooser(i, "共有"));
+        }
+
+        @JavascriptInterface
+        public boolean openUrl(String url) { return startSafely(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+
+        @JavascriptInterface
+        public boolean navigate(String dest) {
+            if (startSafely(new Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(dest))))) return true;
+            return startSafely(new Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(dest))));
+        }
+
+        /** カレンダーの予定作成画面を、中身を入れた状態で開く（保存は本人が押す） */
+        @JavascriptInterface
+        public boolean addEvent(String title, double beginMs, double endMs, String place) {
+            Intent i = new Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
+                    .putExtra(CalendarContract.Events.TITLE, title)
+                    .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, (long) beginMs)
+                    .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, (long) endMs);
+            if (place != null && !place.isEmpty()) i.putExtra(CalendarContract.Events.EVENT_LOCATION, place);
+            return startSafely(i);
+        }
+
+        @JavascriptInterface
+        public void httpGet(String id, String url) { MainActivity.this.httpGet(id, url); }
     }
 }

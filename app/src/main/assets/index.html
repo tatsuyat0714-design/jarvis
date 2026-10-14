@@ -59,6 +59,7 @@ svg.i{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke
 .sheet h2{margin:0;font:700 16px var(--f-body);letter-spacing:.05em}
 .field{display:flex;flex-direction:column;gap:6px}
 .field label{font-size:12px;color:var(--muted);letter-spacing:.05em}
+.field select{background:var(--ink);border:1px solid var(--line);border-radius:10px;color:var(--fg);font:15px var(--f-body);padding:11px 12px;outline:none;width:100%}
 .field input[type=text],.field input[type=password]{background:var(--ink);border:1px solid var(--line);border-radius:10px;color:var(--fg);font:15px var(--f-body);padding:11px 12px;outline:none}
 .field input:focus{border-color:var(--ice-dim)}
 .field .hint{font-size:12px;color:var(--muted);line-height:1.6}
@@ -91,10 +92,13 @@ input[type=range]{width:100%;accent-color:var(--ice)}
   <div class="log" id="log"></div>
 
   <div class="chips" id="chips">
-    <button class="chip">今何時？</button>
+    <button class="chip">おはよう</button>
+    <button class="chip">今日の天気は？</button>
+    <button class="chip">最新ニュース</button>
     <button class="chip">3分タイマー</button>
+    <button class="chip">ライトつけて</button>
+    <button class="chip">バッテリー残量は？</button>
     <button class="chip">明日7時に起こして</button>
-    <button class="chip">YouTubeを開いて</button>
     <button class="chip">メモを読んで</button>
   </div>
 
@@ -131,6 +135,12 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <div class="hint">ふだんは変更不要です。うまく動かないときだけ変えます。</div>
     </div>
     <div class="field">
+      <label for="voice">声の種類</label>
+      <select id="voice"></select>
+      <div class="hint">スマホに入っている日本語の声から選べます。選ぶとすぐ試し聞きできます。男性の声が少ないときは、Playストアの「Google音声サービス」を更新し、スマホの設定の「テキスト読み上げ」で日本語の音声データを追加すると増えることがあります。</div>
+      <button class="btn ghost" id="jarvisPreset">ジャービス風に整える（低め・落ち着き）</button>
+    </div>
+    <div class="field">
       <div class="row"><label>話す速さ</label><span id="rateV"></span></div>
       <input type="range" id="rate" min="0.6" max="1.6" step="0.05">
     </div>
@@ -145,6 +155,11 @@ input[type=range]{width:100%;accent-color:var(--ice)}
     <div class="field">
       <label for="callme">あなたの呼び方</label>
       <input type="text" id="callme" placeholder="ボス">
+    </div>
+    <div class="field">
+      <label for="city">天気を調べる場所</label>
+      <input type="text" id="city" placeholder="東京">
+      <div class="hint">市区町村名でOK（例：横浜、札幌、大阪市北区）。</div>
     </div>
     <div class="btns">
       <button class="btn ghost" id="testVoice">声をテスト</button>
@@ -163,7 +178,7 @@ const A = window.Android || {
   gemini(id){ setTimeout(()=>jarvis.onGemini(id, JSON.stringify({status:0,error:"NO_BRIDGE"})), 10); },
   getPref(k){ try{ return localStorage.getItem("j."+k)||""; }catch(e){ return ""; } },
   setPref(k,v){ try{ localStorage.setItem("j."+k,v); }catch(e){} },
-  exitApp(){}
+  exitApp(){}, listVoices(){ return "[]"; }
 };
 
 const $ = s => document.querySelector(s);
@@ -246,6 +261,170 @@ const actions = {
   },
 };
 
+/* ===== ネットから情報を取る（天気・ニュース・Wikipedia：すべて無料・キー不要） ===== */
+function httpGet(url){
+  return new Promise(res => {
+    const id = "h" + (++reqSeq); waiting[id] = res;
+    if (A.httpGet) A.httpGet(id, url);
+    else fetch(url).then(async r => jarvis.onGemini(id, JSON.stringify({ status:r.status, body: await r.text() })))
+                   .catch(e => jarvis.onGemini(id, JSON.stringify({ status:0, error:String(e) })));
+  });
+}
+const WMO = {0:"快晴",1:"晴れ",2:"晴れ時々くもり",3:"くもり",45:"霧",48:"霧",51:"弱い霧雨",53:"霧雨",55:"強い霧雨",56:"冷たい霧雨",57:"冷たい霧雨",61:"小雨",63:"雨",65:"大雨",66:"冷たい雨",67:"冷たい雨",71:"小雪",73:"雪",75:"大雪",77:"霧雪",80:"にわか雨",81:"にわか雨",82:"激しいにわか雨",85:"にわか雪",86:"激しいにわか雪",95:"雷雨",96:"ひょうを伴う雷雨",99:"ひょうを伴う激しい雷雨"};
+async function geocode(city){
+  let cache = {}; try{ cache = JSON.parse(pref("geo_cache","{}")); }catch(e){}
+  if (cache.name === city && cache.lat != null) return cache;
+  const r = await httpGet("https://geocoding-api.open-meteo.com/v1/search?count=1&language=ja&format=json&name=" + encodeURIComponent(city));
+  if (r.status !== 200) throw new Error("net");
+  const g = (JSON.parse(r.body).results || [])[0];
+  if (!g) throw new Error("notfound");
+  const out = { name:city, lat:g.latitude, lon:g.longitude, label:g.name };
+  A.setPref("geo_cache", JSON.stringify(out));
+  return out;
+}
+async function getWeather({ city, day } = {}){
+  city = String(city || pref("city", "東京")).replace(/(の|市|区|町|村)$/, m => m === "の" ? "" : m);
+  day = Math.max(0, Math.min(2, Number(day) || 0));
+  let g;
+  try{ g = await geocode(city); }
+  catch(e){ return { ok:false, error: e.message === "notfound" ? `「${city}」という場所が見つかりませんでした` : "天気サービスに接続できませんでした" }; }
+  const r = await httpGet(`https://api.open-meteo.com/v1/forecast?latitude=${g.lat}&longitude=${g.lon}&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Asia%2FTokyo&forecast_days=3`);
+  if (r.status !== 200) return { ok:false, error:"天気サービスに接続できませんでした" };
+  const j = JSON.parse(r.body), d = j.daily;
+  return { ok:true, place:g.label, day:["今日","明日","明後日"][day], weather: WMO[d.weather_code[day]] || "不明",
+    max: Math.round(d.temperature_2m_max[day]), min: Math.round(d.temperature_2m_min[day]),
+    rain: d.precipitation_probability_max[day], now: day === 0 && j.current ? Math.round(j.current.temperature_2m) : null };
+}
+function weatherText(w){
+  if (!w.ok) return w.error + "。";
+  return `${w.place}の${w.day}は${w.weather}、最高${w.max}度、最低${w.min}度、降水確率は${w.rain ?? 0}パーセントです。`
+    + (w.now != null ? `今の気温は${w.now}度です。` : "") + ((w.rain ?? 0) >= 50 ? "傘をお持ちになることをおすすめします。" : "");
+}
+async function getNews({ topic } = {}){
+  const url = topic ? `https://news.google.com/rss/search?q=${encodeURIComponent(topic)}&hl=ja&gl=JP&ceid=JP:ja`
+                    : "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja";
+  const r = await httpGet(url);
+  if (r.status !== 200) return { ok:false, error:"ニュースを取得できませんでした" };
+  const doc = new DOMParser().parseFromString(r.body, "text/xml");
+  const items = [...doc.querySelectorAll("item")].slice(0, 5).map(it => {
+    const title = (it.querySelector("title") || {}).textContent || "";
+    const source = (it.querySelector("source") || {}).textContent || "";
+    return { title: title.replace(/\s+-\s+[^-]+$/, "").trim(), source };
+  });
+  return items.length ? { ok:true, items } : { ok:false, error:"ニュースが見つかりませんでした" };
+}
+async function lookup({ query }){
+  query = String(query || "").trim(); if (!query) return { ok:false, error:"何を調べるか分かりませんでした" };
+  const s = await httpGet("https://ja.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=1&srsearch=" + encodeURIComponent(query));
+  if (s.status !== 200) return { ok:false, error:"調べられませんでした" };
+  const hit = ((JSON.parse(s.body).query || {}).search || [])[0];
+  if (!hit) return { ok:false, error:"見つかりませんでした" };
+  const r = await httpGet("https://ja.wikipedia.org/api/rest_v1/page/summary/" + encodeURIComponent(hit.title.replace(/ /g, "_")));
+  if (r.status !== 200) return { ok:false, error:"調べられませんでした" };
+  const j = JSON.parse(r.body);
+  return { ok:true, title:j.title, summary:(j.extract || "").slice(0, 700) };
+}
+const firstSentences = (s, n) => (s.match(/[^。]+。/g) || [s]).slice(0, n).join("");
+const parseJSON = s => { try{ return JSON.parse(s); }catch(e){ return {}; } };
+const contactMsg = (r, who) => r.error === "PERMISSION" ? "連絡先を見る許可が必要です。許可していただいたら、もう一度おっしゃってください。"
+  : r.error === "NOT_FOUND" ? `連絡先に「${who}」さんが見つかりませんでした。` : "うまく開けませんでした。";
+
+/* ===== 追加の操作 ===== */
+Object.assign(actions, {
+  async get_weather(a){ const w = await getWeather(a); if (w.ok) add("act", `☁ ${w.place} ${w.day}：${w.weather} ${w.max}°/${w.min}° 降水${w.rain ?? 0}%`); return w; },
+  async get_news(a){ const n = await getNews(a); if (n.ok) add("sys", "ニュース\n" + n.items.map((x,i)=>`${i+1}. ${x.title}${x.source?"（"+x.source+"）":""}`).join("\n")); return n; },
+  async lookup(a){ return lookup(a); },
+  torch({ on }){ const ok = A.torch ? A.torch(!!on) : false; if (ok) add("act", on ? "🔦 ライト ON" : "🔦 ライト OFF"); return { ok }; },
+  volume({ action, percent }){ const v = A.volume ? A.volume(String(action||""), Number(percent)||0) : -1; if (v >= 0) add("act", `🔊 音量 ${v}%`); return v >= 0 ? { ok:true, volume:v } : { ok:false }; },
+  battery(){ const b = parseJSON(A.battery ? A.battery() : "{}"); return b.level != null ? { ok:true, level:b.level, charging:!!b.charging } : { ok:false }; },
+  call({ who }){ const r = parseJSON(A.dial ? A.dial(String(who||"")) : "{}"); if (r.ok) add("act", `📞 ${r.name} に発信準備（発信ボタンを押してください）`); return r; },
+  send_sms({ who, text }){ const r = parseJSON(A.sms ? A.sms(String(who||""), String(text||"")) : "{}"); if (r.ok) add("act", `✉ ${r.name} へのSMSを下書き（送信ボタンを押してください）`); return r; },
+  share_line({ text }){ const ok = A.share ? A.share(String(text||""), "line") : false; if (ok) add("act", "💬 LINEで送り先を選んでください"); return { ok }; },
+  web_search({ query }){ const ok = A.openUrl ? A.openUrl("https://www.google.com/search?q=" + encodeURIComponent(String(query||""))) : false; if (ok) add("act", `🔎 「${query}」を検索`); return { ok }; },
+  play_youtube({ query }){ const ok = A.openUrl ? A.openUrl("https://www.youtube.com/results?search_query=" + encodeURIComponent(String(query||""))) : false; if (ok) add("act", `▶ YouTubeで「${query}」`); return { ok }; },
+  navigate({ destination }){ const ok = A.navigate ? A.navigate(String(destination||"")) : false; if (ok) add("act", `🧭 ${destination} へナビ開始`); return { ok }; },
+  add_calendar({ title, start, minutes, place }){
+    const b = new Date(String(start||"")); if (isNaN(b)) return { ok:false, error:"日時が正しくありません" };
+    const e = new Date(b.getTime() + (Number(minutes)||60) * 60000);
+    const ok = A.addEvent ? A.addEvent(String(title||"予定"), b.getTime(), e.getTime(), String(place||"")) : false;
+    if (ok) add("act", `📅 予定「${title}」の登録画面を開きました（保存を押してください）`);
+    return { ok };
+  },
+});
+
+/* ===== 追加のローカル命令（AIなし・無料） ===== */
+function localExtra(t, B){
+  // ライト
+  if (/(ライト|懐中電灯|フラッシュ)/.test(t)){
+    if (/(消|けし|オフ|off)/i.test(t)){ return actions.torch({ on:false }).ok ? "ライトを消しました。" : "ライトを操作できませんでした。"; }
+    if (/(つけ|点け|付け|オン|on|照らし)/i.test(t)){ return actions.torch({ on:true }).ok ? `ライトを点けました、${B}。` : "ライトを操作できませんでした。"; }
+  }
+  // 音量・マナーモード
+  if (/マナーモード/.test(t)){
+    const off = /(解除|戻|やめ|オフ)/.test(t);
+    const r = actions.volume({ action: off ? "normal" : "vibrate" });
+    return r.ok ? (off ? "マナーモードを解除しました。" : "マナーモードにしました。") : "切り替えられませんでした。";
+  }
+  if (/(音量|ボリューム|音)/.test(t) && /(上げ|あげ|大き|下げ|さげ|小さ|ミュート|消音|最大|\d+(%|パーセント))/.test(t)){
+    let m = t.match(/(\d+)(%|パーセント)/);
+    const action = m ? "set" : /ミュート|消音/.test(t) ? "mute" : /最大/.test(t) ? "max" : /(上げ|あげ|大き)/.test(t) ? "up" : "down";
+    const r = actions.volume({ action, percent: m ? +m[1] : 0 });
+    return r.ok ? (action === "mute" ? "消音しました。" : `音量を${r.volume}パーセントにしました。`) : "音量を変えられませんでした。";
+  }
+  // バッテリー
+  if (/(バッテリー|電池|充電)/.test(t) && /(残|何|どれ|どのくらい|教|ある|量|状態)/.test(t)){
+    const b = actions.battery();
+    if (!b.ok) return "バッテリーの状態を取得できませんでした。";
+    return `バッテリー残量は${b.level}パーセント${b.charging ? "、ただいま充電中です" : ""}。` + (b.level <= 20 && !b.charging ? `そろそろ充電をおすすめします、${B}。` : "");
+  }
+  // 天気
+  if (/(天気|気温|降水|傘(いる|要る|必要))/.test(t)){
+    const day = /(明後日|あさって)/.test(t) ? 2 : /(明日|あした)/.test(t) ? 1 : 0;
+    let m = t.match(/^(.+?)の(?:今日の|明日の|明後日の|あしたの|あさっての)?(?:天気|気温)/);
+    let city = m && !/^(今日|明日|明後日|あした|あさって|今|いま|現在|週末)$/.test(m[1]) ? m[1] : "";
+    return getWeather({ city, day }).then(w => { if (w.ok) add("act", `☁ ${w.place} ${w.day}：${w.weather} ${w.max}°/${w.min}° 降水${w.rain ?? 0}%`); return weatherText(w); });
+  }
+  // ニュース
+  if (/ニュース/.test(t)){
+    let m = t.match(/^(.+?)(?:の|に関する|についての)(?:最新の?)?ニュース/);
+    const topic = m && !/^(今日|最新|今|いま|最近|主な|主要)$/.test(m[1]) ? m[1] : "";
+    return actions.get_news({ topic }).then(n => n.ok ? `${topic ? topic + "に関する" : "最新の"}ニュースです。` + n.items.slice(0,3).map((x,i)=>`${i+1}、${x.title}`).join("。") + "。" : n.error + "。");
+  }
+  // 電話・SMS・LINE
+  let m = t.match(/^(.+?)(?:さん|くん|ちゃん)?に(?:電話|でんわ|コール)/);
+  if (m){ const r = actions.call({ who:m[1] }); return r.ok ? `${r.name}さんの番号を表示しました。発信ボタンを押してください。` : contactMsg(r, m[1]); }
+  m = t.match(/^(.+?)(?:さん|くん|ちゃん)?に(?:SMS|ショートメール|ショートメッセージ)で?「?(.+?)」?(?:って|と)(?:送|おく)/i);
+  if (m){ const r = actions.send_sms({ who:m[1], text:m[2] }); return r.ok ? `${r.name}さんへのメッセージを用意しました。内容を確認して送信を押してください。` : contactMsg(r, m[1]); }
+  m = t.match(/(?:LINE|ライン)で「?(.+?)」?(?:って|と)(?:送|おく)/i);
+  if (m){ return actions.share_line({ text:m[1] }).ok ? "LINEを開きました。送り先を選んでください。" : "LINEを開けませんでした。"; }
+  // YouTube・検索・ナビ
+  m = t.match(/^(?:YouTube|ユーチューブ)で(.+?)(?:を|の動画を)?(?:流して|再生|見せて|かけて|検索|探して)/i) || t.match(/^(.+?)の(?:曲|音楽|動画|MV)を?(?:流して|かけて|再生して|再生)/);
+  if (m){ actions.play_youtube({ query:m[1] }); return `YouTubeで「${m[1]}」を探します。`; }
+  m = t.match(/^(.+?)(?:で検索|を検索|をググって|ググって)/);
+  if (m){ actions.web_search({ query:m[1] }); return `「${m[1]}」を検索します。`; }
+  m = t.match(/^(.+?)(?:まで|へ)の?(?:ナビ|道案内|行き方|ルート|案内)/);
+  if (m){ return actions.navigate({ destination:m[1] }).ok ? `${m[1]}までの案内を開始します。お気をつけて、${B}。` : "地図アプリを開けませんでした。"; }
+  // 調べもの（AIがあればAIに任せる。なければWikipedia）
+  m = t.match(/^(.+?)(?:って|とは|について)(?:何|なに|なん|誰|だれ|調べて|教えて)/);
+  if (m && !cfg.hasKey){
+    return lookup({ query:m[1] }).then(r => r.ok ? `${r.title}について。${firstSentences(r.summary, 2)}` : `「${m[1]}」については${r.error}。`);
+  }
+  // 朝のブリーフィング
+  if (/^(おはよう|おはよ|グッドモーニング)/.test(t)) return briefing(B);
+  return undefined;
+}
+
+async function briefing(B){
+  const d = now();
+  const parts = [`おはようございます、${B}。今日は${fmtDate(d)}、${fmtTime(d)}です。`];
+  const [w, n] = await Promise.all([getWeather({ day:0 }).catch(() => ({ ok:false })), getNews({}).catch(() => ({ ok:false }))]);
+  if (w.ok){ add("act", `☁ ${w.place}：${w.weather} ${w.max}°/${w.min}° 降水${w.rain ?? 0}%`); parts.push(weatherText(w)); }
+  if (memos.length) parts.push(`メモが${memos.length}件あります。最初は「${memos[0].text}」です。`);
+  if (n.ok){ add("sys", "ニュース\n" + n.items.map((x,i)=>`${i+1}. ${x.title}`).join("\n")); parts.push("主なニュースは、" + n.items.slice(0,3).map(x => x.title).join("。次に、") + "。"); }
+  parts.push("本日もよろしくお願いいたします。");
+  return parts.join("");
+}
+
 /* ===== ローカル命令（無料・オフラインで即実行） ===== */
 let pendingClear = false;
 function local(raw){
@@ -302,6 +481,9 @@ function local(raw){
     if (m && m[1] && !/^(メモ|これ)$/.test(m[1])){ actions.add_memo({ text:m[1] }); return `「${m[1]}」をメモしました。`; }
   }
 
+  const ext = localExtra(t, B);
+  if (ext !== undefined) return ext;
+
   // アプリ起動
   let m = t.match(/^(.+?)(?:を|の)?(?:アプリ)?(?:を)?(開いて|ひらいて|起動して|起動|立ち上げて|つけて|開けて|開く|開け)(?:ください|くれ)?$/);
   if (m){
@@ -323,13 +505,28 @@ const tools = [{ functionDeclarations: [
   { name:"add_memo", description:"メモ・やることを保存する", parameters:{ type:"object", properties:{ text:{type:"string"} }, required:["text"] } },
   { name:"list_memos", description:"保存されたメモを番号付きで取得する" },
   { name:"delete_memo", description:"番号を指定してメモを1件削除する", parameters:{ type:"object", properties:{ n:{type:"integer"} }, required:["n"] } },
+  { name:"get_weather", description:"天気予報を取得する。cityを省略するとユーザーの設定地点", parameters:{ type:"object", properties:{ city:{type:"string",description:"地名（例: 大阪）"}, day:{type:"integer",description:"0=今日 1=明日 2=明後日"} } } },
+  { name:"get_news", description:"最新ニュースの見出しを取得する。topicを指定するとその話題のニュース", parameters:{ type:"object", properties:{ topic:{type:"string"} } } },
+  { name:"lookup", description:"Wikipediaで言葉・人物・物事を調べて要約を得る", parameters:{ type:"object", properties:{ query:{type:"string"} }, required:["query"] } },
+  { name:"torch", description:"スマホのライト（懐中電灯）をつける/消す", parameters:{ type:"object", properties:{ on:{type:"boolean"} }, required:["on"] } },
+  { name:"volume", description:"メディア音量を操作する。action: up, down, mute, unmute, max, set(percent指定), vibrate(マナーモード), normal(マナーモード解除)", parameters:{ type:"object", properties:{ action:{type:"string"}, percent:{type:"integer"} }, required:["action"] } },
+  { name:"battery", description:"バッテリー残量と充電中かどうかを取得する" },
+  { name:"call", description:"連絡先の名前か電話番号を指定し、電話アプリを番号入りで開く（発信はユーザーが押す）", parameters:{ type:"object", properties:{ who:{type:"string"} }, required:["who"] } },
+  { name:"send_sms", description:"SMSを下書き状態で開く（送信はユーザーが押す）", parameters:{ type:"object", properties:{ who:{type:"string"}, text:{type:"string"} }, required:["who","text"] } },
+  { name:"share_line", description:"LINEを開き、文章を送る準備をする（送り先はユーザーが選ぶ）", parameters:{ type:"object", properties:{ text:{type:"string"} }, required:["text"] } },
+  { name:"web_search", description:"ブラウザでGoogle検索を開く", parameters:{ type:"object", properties:{ query:{type:"string"} }, required:["query"] } },
+  { name:"play_youtube", description:"YouTubeで曲や動画を検索して開く", parameters:{ type:"object", properties:{ query:{type:"string"} }, required:["query"] } },
+  { name:"navigate", description:"地図アプリで目的地までのナビを開始する", parameters:{ type:"object", properties:{ destination:{type:"string"} }, required:["destination"] } },
+  { name:"add_calendar", description:"カレンダーの予定作成画面を開く（保存はユーザーが押す）。startはローカル時刻 YYYY-MM-DDTHH:mm", parameters:{ type:"object", properties:{ title:{type:"string"}, start:{type:"string"}, minutes:{type:"integer"}, place:{type:"string"} }, required:["title","start"] } },
 ]}];
 const system = () => `あなたは「ジャービス」。ユーザー専属の、有能で落ち着いた執事型AIアシスタントで、ユーザーのAndroidスマホの中で動いている。
 - ユーザーを「${cfg.callme}」と呼び、丁寧だが少しウィットのある日本語で話す。
 - 返答は音声で読み上げられる。原則1〜3文で簡潔に。マークダウン、箇条書き、絵文字、記号は使わない。
-- タイマー、アラーム、アプリ起動、メモ、時刻の依頼は、必ず用意された関数を使って実行してから結果を短く伝える。
-- 送金、購入、メッセージ送信など、関数にない操作は「まだできません」と正直に伝える。
-- 最新ニュースや天気など、知らない可能性のある情報は推測で断言しない。
+- スマホ操作（タイマー、アラーム、アプリ起動、メモ、ライト、音量、電話、SMS、LINE、検索、YouTube、ナビ、予定）の依頼は、必ず用意された関数を使って実行してから結果を短く伝える。
+- 天気、ニュース、事実の確認は、関数（get_weather、get_news、lookup）で調べてから答える。推測で断言しない。
+- 電話・SMS・LINE・予定は「準備した画面で最後のボタンは本人が押す」仕組み。そう伝える。
+- 送金や購入など、関数にない操作は「まだできません」と正直に伝える。
+- 執事らしく先回りの気配りをひとこと添えてよい（例：雨なら傘、バッテリーが少なければ充電）。
 - 現在: ${fmtDate(now())} ${fmtTime(now())}`;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -452,11 +649,12 @@ async function askAI(text){
     if (r.error){ bubble.parentElement.remove(); history.length = startLen; return aiError(r.error, r.provider); }
     if (r.calls.length){
       history.push(r.content);
-      const responses = r.calls.map(c => {
+      const responses = [];
+      for (const c of r.calls){
         const fn = actions[c.name];
-        let result; try{ result = fn ? fn(c.args || {}) : { error:"unknown function" }; }catch(e){ result = { error:String(e) }; }
-        return { functionResponse:{ name:c.name, response:{ result } } };
-      });
+        let result; try{ result = fn ? await fn(c.args || {}) : { error:"unknown function" }; }catch(e){ result = { error:String(e) }; }
+        responses.push({ functionResponse:{ name:c.name, response:{ result } } });
+      }
       history.push({ role:"user", parts: responses });
       continue;
     }
@@ -476,7 +674,11 @@ async function handle(text, voice){
   viaVoice = !!voice; endConv = false;
   A.stopSpeak();
   add("you", text); q.value = "";
-  const r = local(text);
+  let r = local(text);
+  if (r && typeof r.then === "function"){
+    busy = true; setMode("thinking");
+    try{ r = await r; }catch(e){ r = "うまく取得できませんでした。"; } finally { busy = false; }
+  }
   if (r === null){ setMode("idle"); return; }
   if (r !== undefined){ say(r); return; }
   if (!cfg.hasKey){
@@ -509,6 +711,7 @@ window.jarvis = {
   },
   onGemini(id, json){ const f = waiting[id]; delete waiting[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (f) f(r); },
   onAssist(){ startListen(); },
+  onContactsPermission(ok){ add("sys", ok ? "連絡先の許可をいただきました。もう一度おっしゃってください。" : "連絡先の許可がないため、名前での電話・SMSはできません。番号で言っていただければ使えます。"); },
   onBack(){ if (!$("#sheet").hidden){ closeSheet(false); } else A.exitApp(); },
 };
 
@@ -523,12 +726,28 @@ const sheet = $("#sheet");
 function openSheet(){
   $("#key").value = pref("gemini_key",""); $("#model").value = pref("gemini_model","");
   $("#gkey").value = pref("groq_key","");
-  $("#rate").value = pref("rate_v","1.05"); $("#pitch").value = pref("pitch_v","0.9");
+  $("#rate").value = pref("rate_v","1.0"); $("#pitch").value = pref("pitch_v","0.85");
   $("#callme").value = pref("callme","");
   $("#conv").classList.toggle("on", cfg.conv);
   $("#gfirst").classList.toggle("on", groqFirst());
+  $("#city").value = pref("city","");
+  fillVoices();
   syncRange(); sheet.hidden = false;
 }
+function fillVoices(){
+  const sel = $("#voice"); sel.textContent = "";
+  const cur = pref("voice_name", "");
+  let list = []; try{ list = JSON.parse(A.listVoices ? A.listVoices() : "[]"); }catch(e){}
+  list.sort((a,b) => (a.network - b.network) || a.name.localeCompare(b.name));
+  const opt = (v, label) => { const o = document.createElement("option"); o.value = v; o.textContent = label; if (v === cur) o.selected = true; sel.append(o); };
+  opt("", "おまかせ（標準の声）");
+  list.forEach((v, i) => {
+    const code = (v.name.match(/x-([a-z]{3})/) || [])[1] || v.name;
+    opt(v.name, `声 ${i+1}（${code}）${v.network ? "・ネット接続時" : ""}`);
+  });
+  if (!list.length) opt("__none", "（声の一覧を取得できませんでした）");
+}
+const voiceSample = () => `お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。システムはすべて正常に稼働しております。`;
 function syncRange(){ $("#rateV").textContent = Number($("#rate").value).toFixed(2); $("#pitchV").textContent = Number($("#pitch").value).toFixed(2); }
 function saveKeys(){
   A.setPref("gemini_key", $("#key").value.trim());
@@ -542,6 +761,9 @@ function closeSheet(save){
     A.setPref("rate_v", $("#rate").value); A.setPref("pitch_v", $("#pitch").value);
     A.setVoice(Number($("#rate").value), Number($("#pitch").value));
     A.setPref("callme", $("#callme").value.trim());
+    const city = $("#city").value.trim(); if (city !== pref("city","")) A.setPref("geo_cache", "{}");
+    A.setPref("city", city);
+    const vn = $("#voice").value; if (vn !== "__none") A.setVoiceName && A.setVoiceName(vn);
     A.setPref("conv", $("#conv").classList.contains("on") ? "1" : "0");
     add("sys", "設定を保存しました");
   }
@@ -552,7 +774,12 @@ $("#saveSet").onclick = () => closeSheet(true);
 $("#conv").onclick = e => e.currentTarget.classList.toggle("on");
 $("#gfirst").onclick = e => e.currentTarget.classList.toggle("on");
 $("#rate").oninput = $("#pitch").oninput = syncRange;
-$("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(`お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。`); };
+$("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(voiceSample()); };
+$("#voice").onchange = () => { const v = $("#voice").value; if (v === "__none") return; A.setVoiceName && A.setVoiceName(v); A.setVoice(Number($("#rate").value), Number($("#pitch").value)); setTimeout(() => A.speak(voiceSample()), 250); };
+$("#jarvisPreset").onclick = () => {
+  $("#rate").value = "0.95"; $("#pitch").value = "0.8"; syncRange();
+  A.setVoice(0.95, 0.8); A.speak(voiceSample());
+};
 sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(false); });
 $("#testConn").onclick = async () => {
   const b = $("#testConn"); if (b.disabled) return;
@@ -609,7 +836,7 @@ requestAnimationFrame(draw);
   const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
   add("j", `${greet}、${cfg.callme}。下のマイクボタンを押して話しかけてください。`);
   if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiかGroqのAPIキーを登録してください。");
-  A.setVoice(Number(pref("rate_v","1.05")), Number(pref("pitch_v","0.9")));
+  A.setVoice(Number(pref("rate_v","1.0")), Number(pref("pitch_v","0.85")));
 })();
 </script>
 </body>
