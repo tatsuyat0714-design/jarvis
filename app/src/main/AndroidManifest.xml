@@ -6,6 +6,12 @@
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <!-- 「〇〇に電話」「〇〇にSMS」で名前から番号を探すため（使うときに許可を聞く） -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- 常駐（通知・浮かぶ光の玉・再起動後の自動復帰） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <queries>
         <!-- 「〇〇を開いて」のためにインストール済みアプリを探す -->
@@ -73,5 +79,34 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".JarvisService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Personal voice assistant that stays available via a floating button and notification" />
+        </service>
+
+        <service
+            android:name=".JarvisTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_jarvis"
+            android:label="ジャービス"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

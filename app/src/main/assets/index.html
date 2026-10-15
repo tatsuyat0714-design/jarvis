@@ -6,7 +6,7 @@
 <title>ジャービス</title>
 <style>
 :root{
-  --ink:#070b10; --panel:#0d151d; --panel2:#111c26; --line:#1d2c38;
+  --ink:#02060b; --panel:#0d151d; --panel2:#111c26; --line:#1d2c38;
   --ice:#8fd8ff; --ice-dim:#4a7d99; --amber:#ffb454; --red:#ff6b6b;
   --fg:#dbe7ee; --muted:#7f95a3;
   --f-display:"Rajdhani","Roboto Condensed","Roboto",sans-serif;
@@ -23,8 +23,8 @@ header{display:flex;align-items:center;justify-content:space-between}
 .icon-btn.on{color:var(--ice);border-color:var(--ice-dim)}
 .hb{display:flex;gap:8px}
 
-.core{position:relative;display:grid;place-items:center;flex:0 0 auto}
-#ring{width:min(56vw,240px);height:min(56vw,240px)}
+.core{position:relative;flex:0 0 auto}
+#holo{display:block;width:100%;height:min(46vh,380px);border-radius:12px;background:#02060b;touch-action:none}
 .state{position:absolute;bottom:0;left:0;right:0;text-align:center;font-family:var(--f-display);font-size:12px;letter-spacing:.3em;color:var(--ice-dim)}
 
 .log{flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding:6px 2px;user-select:text;
@@ -71,6 +71,7 @@ input[type=range]{width:100%;accent-color:var(--ice)}
 .toggle.on::after{left:25px;background:var(--ice)}
 .btn{background:var(--ice);color:var(--ink);border:0;border-radius:12px;padding:13px;font:700 15px var(--f-body)}
 .btn.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+.group{display:flex;flex-direction:column;gap:14px;padding:14px;border:1px solid var(--line);border-radius:14px}
 .btns{display:flex;gap:10px}.btns .btn{flex:1}
 </style>
 </head>
@@ -85,8 +86,8 @@ input[type=range]{width:100%;accent-color:var(--ice)}
   </header>
 
   <div class="core">
-    <canvas id="ring" width="480" height="480"></canvas>
-    <div class="state" id="state">STANDBY</div>
+    <canvas id="holo" aria-label="ジャービス（タップで話しかける）"></canvas>
+    <div class="state" id="state" hidden>STANDBY</div>
   </div>
 
   <div class="log" id="log"></div>
@@ -114,6 +115,22 @@ input[type=range]{width:100%;accent-color:var(--ice)}
 <div class="sheet" id="sheet" hidden>
   <div class="in">
     <h2>設定</h2>
+    <div class="group">
+      <div class="row">
+        <div class="field" style="flex:1"><label>スマホに常駐する</label><div class="hint">通知欄に「話しかける」ボタンが出て、どの画面からでも呼べます。再起動後も自動で待機します。</div></div>
+        <button class="toggle" id="resident" aria-label="常駐"></button>
+      </div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>浮かぶ光の玉</label><div class="hint">他のアプリの上に小さな玉を表示。タップで話しかけ、ドラッグで移動、長押しで隠します。</div></div>
+        <button class="toggle" id="orb" aria-label="光の玉"></button>
+      </div>
+      <button class="btn ghost" id="overlayBtn" hidden>「他のアプリの上に表示」を許可する</button>
+      <div class="row">
+        <div class="field" style="flex:1"><label>呼び出し後は元の画面に戻る</label><div class="hint">玉や通知から呼んだとき、答え終わったら自動で前の画面に戻ります。</div></div>
+        <button class="toggle" id="autoBack" aria-label="元の画面に戻る"></button>
+      </div>
+      <button class="btn ghost" id="assistBtn">ホームボタン長押しで呼べるようにする</button>
+    </div>
     <div class="field">
       <label for="key">頭脳（Gemini）のAPIキー</label>
       <input type="password" id="key" placeholder="AIza... を貼り付け">
@@ -178,7 +195,7 @@ const A = window.Android || {
   gemini(id){ setTimeout(()=>jarvis.onGemini(id, JSON.stringify({status:0,error:"NO_BRIDGE"})), 10); },
   getPref(k){ try{ return localStorage.getItem("j."+k)||""; }catch(e){ return ""; } },
   setPref(k,v){ try{ localStorage.setItem("j."+k,v); }catch(e){} },
-  exitApp(){}, listVoices(){ return "[]"; }
+  exitApp(){}, listVoices(){ return "[]"; }, isResident(){ return false; }, isOrb(){ return true; }, canOverlay(){ return false; }
 };
 
 const $ = s => document.querySelector(s);
@@ -206,7 +223,14 @@ function add(cls, text){
 }
 
 /* ===== 話す ===== */
-let viaVoice = false, endConv = false;
+let viaVoice = false, endConv = false, quickCall = false, backTimer = null;
+// 玉や通知から呼ばれたときは、答え終わったら元の画面へ戻る
+function maybeGoBack(){
+  if (!quickCall || pref("auto_back", "1") !== "1" || (cfg.conv && !endConv)) return;
+  clearTimeout(backTimer);
+  backTimer = setTimeout(() => { if (mode === "idle" && !busy && sheet.hidden){ quickCall = false; A.exitApp(); } }, 1600);
+}
+document.addEventListener("pointerdown", () => { clearTimeout(backTimer); quickCall = false; }, true);
 function say(text){
   add("j", text);
   const clean = text.replace(/[*#`_>|~]/g, "").replace(/\n+/g, "。");
@@ -696,6 +720,7 @@ window.jarvis = {
     if (s === "start") setMode("speaking");
     else { if (mode === "speaking") setMode("idle");
       if (s === "end" && viaVoice && cfg.conv && !endConv && !busy) setTimeout(() => { if (mode === "idle") startListen(); }, 350);
+      else if (s === "end") maybeGoBack();
     }
   },
   onListen(s){ if (s === "ready") setMode("listening"); if (s === "end" && mode === "listening") setMode("thinking"); },
@@ -710,7 +735,7 @@ window.jarvis = {
     // 7=聞き取れず 6=無音タイムアウト → 静かに待機に戻る
   },
   onGemini(id, json){ const f = waiting[id]; delete waiting[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (f) f(r); },
-  onAssist(){ startListen(); },
+  onAssist(quick){ quickCall = !!quick; if (mode !== "listening") startListen(); },
   onContactsPermission(ok){ add("sys", ok ? "連絡先の許可をいただきました。もう一度おっしゃってください。" : "連絡先の許可がないため、名前での電話・SMSはできません。番号で言っていただければ使えます。"); },
   onBack(){ if (!$("#sheet").hidden){ closeSheet(false); } else A.exitApp(); },
 };
@@ -731,6 +756,7 @@ function openSheet(){
   $("#conv").classList.toggle("on", cfg.conv);
   $("#gfirst").classList.toggle("on", groqFirst());
   $("#city").value = pref("city","");
+  syncResidentUI();
   fillVoices();
   syncRange(); sheet.hidden = false;
 }
@@ -773,6 +799,24 @@ $("#setBtn").onclick = openSheet;
 $("#saveSet").onclick = () => closeSheet(true);
 $("#conv").onclick = e => e.currentTarget.classList.toggle("on");
 $("#gfirst").onclick = e => e.currentTarget.classList.toggle("on");
+function syncResidentUI(){
+  const res = A.isResident ? A.isResident() : false, orb = A.isOrb ? A.isOrb() : true, can = A.canOverlay ? A.canOverlay() : false;
+  $("#resident").classList.toggle("on", res);
+  $("#orb").classList.toggle("on", orb);
+  $("#overlayBtn").hidden = !(res && orb && !can);
+  $("#autoBack").classList.toggle("on", pref("auto_back", "1") === "1");
+}
+$("#resident").onclick = () => {
+  const on = !$("#resident").classList.contains("on");
+  A.setResident && A.setResident(on);
+  add("sys", on ? "常駐を開始しました。通知欄からいつでも呼べます。" : "常駐を終了しました。");
+  setTimeout(syncResidentUI, 300);
+};
+$("#orb").onclick = () => { const on = !$("#orb").classList.contains("on"); A.setOrb && A.setOrb(on); setTimeout(syncResidentUI, 300); };
+$("#overlayBtn").onclick = () => { A.openOverlaySettings && A.openOverlaySettings(); };
+$("#autoBack").onclick = e => { const on = !e.currentTarget.classList.contains("on"); A.setPref("auto_back", on ? "1" : "0"); e.currentTarget.classList.toggle("on", on); };
+$("#assistBtn").onclick = () => { add("sys", "開いた画面で「デフォルトのアシスタントアプリ」→「ジャービス」を選んでください。"); A.openAssistantSettings && A.openAssistantSettings(); };
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !sheet.hidden) syncResidentUI(); });
 $("#rate").oninput = $("#pitch").oninput = syncRange;
 $("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(voiceSample()); };
 $("#voice").onchange = () => { const v = $("#voice").value; if (v === "__none") return; A.setVoiceName && A.setVoiceName(v); A.setVoice(Number($("#rate").value), Number($("#pitch").value)); setTimeout(() => A.speak(voiceSample()), 250); };
@@ -802,39 +846,99 @@ $("#testConn").onclick = async () => {
   sheet.hidden = true;
 };
 
-/* ===== リング ===== */
-const cv = $("#ring"), cx = cv.getContext("2d");
-let energy = 0, level = 0, t0 = performance.now();
-function draw(nowT){
-  const t = (nowT - t0)/1000, W = cv.width, C = W/2;
-  const target = { idle:.15, listening:.55 + level*.45, thinking:.85, speaking:1 }[mode];
-  energy += (target - energy) * 0.08;
-  cx.clearRect(0,0,W,W);
-  const pulse = mode === "speaking" ? (Math.sin(t*14)+Math.sin(t*9.3))*0.25+0.5 : mode === "listening" ? level : 0;
-  const speed = 0.15 + energy*1.2;
-  const g = cx.createRadialGradient(C,C,0,C,C,W*.3);
-  g.addColorStop(0, mode==="listening" ? `rgba(255,180,84,${.3+pulse*.4})` : `rgba(143,216,255,${.35+energy*.35+pulse*.2})`);
-  g.addColorStop(1, "rgba(143,216,255,0)");
-  cx.fillStyle = g; cx.beginPath(); cx.arc(C,C,W*.3,0,Math.PI*2); cx.fill();
-  cx.lineCap = "round";
-  cx.strokeStyle = `rgba(143,216,255,${.7+pulse*.3})`; cx.lineWidth = 3;
-  cx.beginPath(); cx.arc(C,C,W*(.13+pulse*.02),0,Math.PI*2); cx.stroke();
-  [{r:.22,n:3,gap:.5,w:10,dir:1,sp:1},{r:.30,n:24,gap:.45,w:6,dir:-1,sp:.6},{r:.38,n:5,gap:.35,w:3,dir:1,sp:.35},{r:.45,n:72,gap:.6,w:3,dir:-1,sp:.15}]
-  .forEach((R,k) => {
-    const seg = Math.PI*2/R.n, rot = t*speed*R.sp*R.dir;
-    cx.lineWidth = R.w;
-    cx.strokeStyle = k===3 ? "rgba(74,125,153,.8)" : `rgba(143,216,255,${.35+energy*.5})`;
-    for (let i=0;i<R.n;i++){ const a = rot + i*seg; cx.beginPath(); cx.arc(C,C,W*R.r,a,a+seg*(1-R.gap)); cx.stroke(); }
-  });
-  requestAnimationFrame(draw);
+/* ===== ホログラム（ドラッグで回転・ピンチで拡大・タップで話しかける） ===== */
+let level = 0;
+(() => {
+const cv = $("#holo"), ctx = cv.getContext("2d");
+let W, H, DPR;
+function size(){ DPR = Math.min(2, devicePixelRatio || 1); W = cv.clientWidth; H = cv.clientHeight; cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }
+size(); addEventListener("resize", size);
+let yaw = 0, pitch = 0.25, zoom = 1, t = 0, energy = 0.3, speed = 1, waves = [], kick = 0, lastMode = "idle";
+const R = () => Math.min(W, H) * 0.33 * zoom;
+function proj(x,y,z){ const cy=Math.cos(yaw),sy=Math.sin(yaw); const x1=x*cy+z*sy,z1=-x*sy+z*cy; const cp=Math.cos(pitch),sp=Math.sin(pitch); const y1=y*cp-z1*sp,z2=y*sp+z1*cp; const p=3/(3+z2); const r=R(); return [W/2+x1*r*p, H/2-y1*r*p, z2]; }
+function gauss(){ return (Math.random()+Math.random()+Math.random()-1.5)/1.5; }
+const bands=[]; for(let i=0;i<14;i++) bands.push({phi:Math.acos(1-2*Math.random()),w:0.03+Math.random()*0.12,sp:(0.2+Math.random()*0.8)*(Math.random()<0.3?-1:1)});
+const P=[]; for(let i=0;i<2200;i++){ let phi,th=Math.random()*Math.PI*2,r,sp; if(Math.random()<0.7){ const b=bands[i%bands.length]; phi=b.phi+gauss()*b.w; sp=b.sp; r=0.78+gauss()*0.12; } else { phi=Math.acos(1-2*Math.random()); sp=0.3; r=0.3+Math.random()*0.75; } P.push({th,phi,r,sp,s:Math.random(),tw:Math.random()*6}); }
+const AR=[]; for(let i=0;i<46;i++) AR.push({r:0.55+Math.random()*0.7,ax:Math.random()*Math.PI,az:Math.random()*Math.PI,st:Math.random()*6.28,len:0.2+Math.random()*1.6,sp:(Math.random()-0.5)*0.9,w:0.6+Math.random()*1.8,a:0.25+Math.random()*0.6,dash:Math.random()<0.35});
+const K=[]; for(let i=0;i<70;i++) K.push({a:Math.random()*6.28,r:1.05+Math.random()*0.35,l:0.03+Math.random()*0.18,y:gauss()*0.25,sp:0.2+Math.random()*0.6});
+function rot(x,y,z,ax,az){ let y1=y*Math.cos(ax)-z*Math.sin(ax),z1=y*Math.sin(ax)+z*Math.cos(ax); let x2=x*Math.cos(az)-y1*Math.sin(az),y2=x*Math.sin(az)+y1*Math.cos(az); return [x2,y2,z1]; }
+function dAlpha(z){ return Math.max(0.15, Math.min(1, 0.65 - z*0.45)); }
+const LABEL = { idle:"STANDBY", listening:"LISTENING", thinking:"ANALYZING", speaking:"SPEAKING" };
+let drag = false;
+function frame(){
+  if (document.hidden){ requestAnimationFrame(frame); return; }
+  t += 1/60;
+  // ジャービスの状態に合わせて明るさ・速さを変える
+  const eT = { idle:0.3, listening:0.55 + level*0.45, thinking:0.75, speaking:1 }[mode] ?? 0.3;
+  const sT = { idle:1, listening:2.2, thinking:3.2, speaking:1.6 }[mode] ?? 1;
+  if (mode !== lastMode){ if (mode === "speaking" || mode === "listening") waves.push({ r:R()*0.2, a:0.7 }); lastMode = mode; }
+  energy += (eT - energy)*0.05; speed += (sT - speed)*0.05; kick *= 0.94;
+  if (!drag) yaw += 0.003*speed;
+  ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1; ctx.fillStyle = "rgba(2,6,11,0.55)"; ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation = "lighter";
+  const cx = W/2, cy = H/2, r = R();
+  let gr = ctx.createRadialGradient(cx,cy,0,cx,cy,r*1.5);
+  gr.addColorStop(0, mode === "listening" ? `rgba(230,160,70,${0.14+energy*0.12})` : `rgba(60,150,230,${0.18+energy*0.15})`);
+  gr.addColorStop(1, "rgba(0,0,0,0)"); ctx.fillStyle = gr; ctx.fillRect(0,0,W,H);
+  const pulse = mode === "speaking" ? 1 : 0, jit = mode === "listening" ? 1 : 0, think = mode === "thinking" ? 1 : 0;
+  for (const p of P){
+    p.th += 0.004*p.sp*speed;
+    let rr = p.r*(1+kick*0.25);
+    if (pulse) rr *= 1 + 0.06*Math.sin(t*11+p.phi*5)*energy;
+    if (jit) rr += Math.sin(t*20+p.tw*9)*(0.008+level*0.02);
+    if (think) rr *= 1 + 0.03*Math.sin(t*6+p.th*3);
+    const sx = Math.sin(p.phi); const q = proj(rr*sx*Math.cos(p.th), rr*Math.cos(p.phi), rr*sx*Math.sin(p.th));
+    const tw = 0.55 + 0.45*Math.sin(t*3+p.tw); const a = dAlpha(q[2])*tw*(0.45+energy*0.6);
+    ctx.fillStyle = p.s > 0.94 ? `rgba(225,248,255,${a})` : `rgba(90,190,255,${a*0.85})`;
+    const s = p.s > 0.94 ? 2.2 : 1.3; ctx.fillRect(q[0]-s/2, q[1]-s/2, s, s);
+  }
+  ctx.lineCap = "round";
+  for (const c of AR){
+    c.st += 0.006*c.sp*speed; const n = Math.max(6, Math.floor(c.len*24)); ctx.lineWidth = c.w; let prev = null;
+    for (let i=0;i<=n;i++){
+      const a = c.st + c.len*i/n; const rr = c.r*(1+kick*0.2); const v = rot(Math.cos(a)*rr, 0, Math.sin(a)*rr, c.ax, c.az); const q = proj(v[0],v[1],v[2]);
+      if (prev && !(c.dash && i%3===0)){ ctx.strokeStyle = `rgba(110,205,255,${c.a*dAlpha(q[2])*(0.4+energy*0.7)})`; ctx.beginPath(); ctx.moveTo(prev[0],prev[1]); ctx.lineTo(q[0],q[1]); ctx.stroke(); }
+      prev = q;
+    }
+  }
+  ctx.lineWidth = 1;
+  for (const k of K){ k.a += 0.003*k.sp*speed; const p1 = proj(Math.cos(k.a)*k.r, k.y, Math.sin(k.a)*k.r), p2 = proj(Math.cos(k.a)*(k.r+k.l), k.y, Math.sin(k.a)*(k.r+k.l)); ctx.strokeStyle = `rgba(150,220,255,${0.5*dAlpha(p1[2])*(0.4+energy)})`; ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke(); }
+  const tl = 1.32;
+  for (let i=0;i<120;i++){ const a = i/120*6.28 + t*0.1; const L = i%10===0 ? 0.08 : 0.03; const v1 = rot(Math.cos(a)*tl,0,Math.sin(a)*tl,1.25,0.2), v2 = rot(Math.cos(a)*(tl+L),0,Math.sin(a)*(tl+L),1.25,0.2); const q1 = proj(...v1), q2 = proj(...v2); ctx.strokeStyle = `rgba(120,200,255,${0.35*dAlpha(q1[2])})`; ctx.beginPath(); ctx.moveTo(q1[0],q1[1]); ctx.lineTo(q2[0],q2[1]); ctx.stroke(); }
+  const cr = r*(0.2 + energy*0.12 + (pulse ? 0.05*Math.abs(Math.sin(t*9)) : 0) + (jit ? level*0.08 : 0) + kick*0.1);
+  gr = ctx.createRadialGradient(cx,cy,0,cx,cy,cr);
+  gr.addColorStop(0, "rgba(235,250,255,0.95)");
+  gr.addColorStop(0.25, mode === "listening" ? "rgba(255,190,110,0.6)" : "rgba(120,210,255,0.6)");
+  gr.addColorStop(1, "rgba(0,80,160,0)");
+  ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(cx,cy,cr,0,6.28); ctx.fill();
+  waves = waves.filter(w => { w.r += 6; w.a *= 0.95; ctx.strokeStyle = `rgba(140,220,255,${w.a})`; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx,cy,w.r,0,6.28); ctx.stroke(); return w.a > 0.03; });
+  // HUD の枠と文字
+  ctx.globalCompositeOperation = "source-over"; ctx.strokeStyle = "rgba(110,200,255,0.55)"; ctx.lineWidth = 1.2; const m = 10, L = 22;
+  [[m,m,1,1],[W-m,m,-1,1],[m,H-m,1,-1],[W-m,H-m,-1,-1]].forEach(([x,y,dx,dy]) => { ctx.beginPath(); ctx.moveTo(x+dx*L,y); ctx.lineTo(x,y); ctx.lineTo(x,y+dy*L); ctx.stroke(); });
+  ctx.globalAlpha = 0.35; ctx.beginPath(); ctx.moveTo(m+40,m+6); ctx.lineTo(W*0.55,m+6); ctx.moveTo(W*0.45,H-m-6); ctx.lineTo(W-m-40,H-m-6); ctx.stroke(); ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(140,215,255,0.8)"; ctx.font = "11px ui-monospace,monospace"; ctx.textAlign = "left";
+  ctx.fillText("J.A.R.V.I.S", m+8, m+24);
+  ctx.fillStyle = mode === "listening" ? "rgba(255,190,110,0.85)" : "rgba(140,215,255,0.55)"; ctx.fillText(LABEL[mode] || "STANDBY", m+8, m+40);
+  ctx.fillStyle = "rgba(140,215,255,0.5)"; ctx.textAlign = "right";
+  ctx.fillText("PWR " + Math.round(energy*100) + "%", W-m-8, m+24); ctx.fillText("SYNC " + (98+Math.sin(t)*1.5).toFixed(1), W-m-8, m+40);
+  for (let i=0;i<5;i++){ const v = 0.3 + 0.7*Math.abs(Math.sin(t*(1+i*0.7)+i))*energy; ctx.fillRect(W-m-8-50*v, H-m-24-i*7, 50*v, 3); }
+  ctx.textAlign = "left";
+  requestAnimationFrame(frame);
 }
-requestAnimationFrame(draw);
+const pts = new Map(); let moved = 0, p0 = 0, z0 = 1;
+cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, [e.offsetX, e.offsetY]); moved = 0; drag = true; if (pts.size === 2){ const [a,b] = [...pts.values()]; p0 = Math.hypot(a[0]-b[0], a[1]-b[1]); z0 = zoom; } });
+cv.addEventListener("pointermove", e => { if (!pts.has(e.pointerId)) return; const o = pts.get(e.pointerId); const dx = e.offsetX-o[0], dy = e.offsetY-o[1]; pts.set(e.pointerId, [e.offsetX, e.offsetY]); moved += Math.abs(dx)+Math.abs(dy); if (pts.size === 2){ const [a,b] = [...pts.values()]; zoom = Math.max(0.5, Math.min(2.2, z0*Math.hypot(a[0]-b[0], a[1]-b[1])/p0)); } else { yaw += dx*0.01; pitch = Math.max(-1.3, Math.min(1.3, pitch+dy*0.008)); } });
+function end(e){ if (pts.size === 1 && moved < 8){ waves.push({ r:R()*0.2, a:0.8 }); kick = 1; startListen(); } pts.delete(e.pointerId); if (!pts.size) drag = false; }
+cv.addEventListener("pointerup", end);
+cv.addEventListener("pointercancel", e => { pts.delete(e.pointerId); if (!pts.size) drag = false; });
+frame();
+})();
 
 /* ===== 起動時 ===== */
 (function boot(){
   const h = now().getHours();
   const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
-  add("j", `${greet}、${cfg.callme}。下のマイクボタンを押して話しかけてください。`);
+  add("j", `${greet}、${cfg.callme}。ホログラムをタップするか、マイクボタンで話しかけてください。`);
   if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiかGroqのAPIキーを登録してください。");
   A.setVoice(Number(pref("rate_v","1.0")), Number(pref("pitch_v","0.85")));
 })();

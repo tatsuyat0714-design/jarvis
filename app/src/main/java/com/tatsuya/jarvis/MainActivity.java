@@ -59,6 +59,8 @@ public class MainActivity extends Activity {
 
     private static final int REQ_MIC = 1;
     private static final int REQ_CONTACTS = 2;
+    private static final int REQ_NOTIF = 3;
+    static final String ACTION_LISTEN = "com.tatsuya.jarvis.LISTEN";
 
     private WebView web;
     private TextToSpeech tts;
@@ -72,15 +74,15 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Window w = getWindow();
-        w.setStatusBarColor(Color.parseColor("#070B10"));
-        w.setNavigationBarColor(Color.parseColor("#070B10"));
+        w.setStatusBarColor(Color.parseColor("#02060B"));
+        w.setNavigationBarColor(Color.parseColor("#02060B"));
         w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
         prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE);
 
         web = new WebView(this);
-        web.setBackgroundColor(Color.parseColor("#070B10"));
+        web.setBackgroundColor(Color.parseColor("#02060B"));
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -89,6 +91,10 @@ public class MainActivity extends Activity {
         web.addJavascriptInterface(new Bridge(), "Android");
         setContentView(web);
         web.loadUrl("file:///android_asset/index.html");
+
+        if ("1".equals(prefs.getString("resident", "0"))) {
+            try { JarvisService.start(this); } catch (Exception ignored) {}
+        }
 
         tts = new TextToSpeech(this, status -> {
             if (status == TextToSpeech.SUCCESS) {
@@ -110,16 +116,29 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        if (Intent.ACTION_ASSIST.equals(intent.getAction())) js("jarvis.onAssist()");
+        setIntent(intent);
+        if (isCallIntent(intent)) {
+            intent.setAction(Intent.ACTION_MAIN);
+            main.postDelayed(() -> js("jarvis.onAssist(true)"), 250);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (Intent.ACTION_ASSIST.equals(getIntent().getAction())) {
-            getIntent().setAction(Intent.ACTION_MAIN);
-            main.postDelayed(() -> js("jarvis.onAssist()"), 600);
+        if ("1".equals(prefs.getString("resident", "0"))) {
+            try { JarvisService.start(this); } catch (Exception ignored) {}
         }
+        if (isCallIntent(getIntent())) {
+            getIntent().setAction(Intent.ACTION_MAIN);
+            main.postDelayed(() -> js("jarvis.onAssist(true)"), 700);
+        }
+    }
+
+    private static boolean isCallIntent(Intent i) {
+        if (i == null) return false;
+        String a = i.getAction();
+        return Intent.ACTION_ASSIST.equals(a) || ACTION_LISTEN.equals(a);
     }
 
     @Override
@@ -608,5 +627,53 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void httpGet(String id, String url) { MainActivity.this.httpGet(id, url); }
+
+        // ----- 常駐 -----
+        @JavascriptInterface
+        public void setResident(boolean on) {
+            prefs.edit().putString("resident", on ? "1" : "0").apply();
+            main.post(() -> {
+                if (on) {
+                    if (android.os.Build.VERSION.SDK_INT >= 33
+                            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
+                    }
+                    try { JarvisService.start(MainActivity.this); } catch (Exception ignored) {}
+                } else {
+                    JarvisService.stop(MainActivity.this);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public boolean isResident() { return "1".equals(prefs.getString("resident", "0")); }
+
+        @JavascriptInterface
+        public void setOrb(boolean on) {
+            prefs.edit().putString("orb", on ? "1" : "0").apply();
+            if (isResident()) main.post(() -> { try { JarvisService.start(MainActivity.this); } catch (Exception ignored) {} });
+        }
+
+        @JavascriptInterface
+        public boolean isOrb() { return "1".equals(prefs.getString("orb", "1")); }
+
+        @JavascriptInterface
+        public boolean canOverlay() {
+            return android.os.Build.VERSION.SDK_INT < 23 || android.provider.Settings.canDrawOverlays(MainActivity.this);
+        }
+
+        /** 「他のアプリの上に表示」の許可画面を開く */
+        @JavascriptInterface
+        public void openOverlaySettings() {
+            startSafely(new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())));
+        }
+
+        /** 「デフォルトのアシスタント」設定画面を開く */
+        @JavascriptInterface
+        public void openAssistantSettings() {
+            if (!startSafely(new Intent(android.provider.Settings.ACTION_VOICE_INPUT_SETTINGS)))
+                startSafely(new Intent(android.provider.Settings.ACTION_SETTINGS));
+        }
     }
 }
