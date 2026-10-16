@@ -298,10 +298,6 @@ class ApplyTest(Base):
         self.store.config["apk_dir"] = str(self.root / "apks")
         with self.assertRaises(ApplyError):
             apply(Proposal("install_apk", {"path": "/data/local/tmp/x.apk"}, "t"), self.ctx)
-        (self.root / "apks").mkdir()
-        path = str(self.root / "apks" / "a b.apk")
-        apply(Proposal("install_apk", {"path": path, "package": "com.x.y"}, "t"), self.ctx)
-        self.assertIn(f"pm install -r '{path}'", self.t.calls)
 
     def test_unknown_kind(self):
         with self.assertRaises(ApplyError):

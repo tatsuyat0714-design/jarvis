@@ -54,7 +54,7 @@ python CLI ──> WrapperTransport ──> adbw.sh ──┬─> adb -s 127.0.0
 実機での確認手順は [DEVICE_TEST.md](DEVICE_TEST.md) にまとめている。
 
 ```sh
-pkg install python android-tools git termux-api aapt
+pkg install python android-tools git termux-api
 termux-setup-storage   # 重複検出で /sdcard を読むため
 git clone <このリポジトリ> && cd jarvis/agent
 ```
@@ -200,8 +200,24 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
 |---|---|---|
 | optimize | 空き容量、`ps` の RSS 上位（前面アプリ・システムを除くユーザーアプリ） | `pm trim-caches`（低）、300MB 以上のバックグラウンドアプリを `am kill`（低） |
 | unused | `dumpsys usagestats` の全期間から最終使用日時、候補だけ `firstInstallTime` | 30 日以上未使用のアプリをアンインストール（高）。インストール直後のアプリと Termux / Shizuku は除外 |
-| updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。要 `pkg install aapt` |
+| updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。詳細は下記 |
 | dupes | サイズ → 先頭 64KiB の SHA-256 → 全体の SHA-256。ハッシュはキャッシュ | 残す 1 つ以外をゴミ箱へ移動（高） |
+
+### 自動更新（updates）の流れ
+
+1. `apk_dir`（既定 `/sdcard/Download`）直下の `.apk` を読む。AndroidManifest.xml（バイナリ XML）を自前で解析するので
+   **aapt は不要**（読めない APK だけ、aapt があればそれで読む）
+2. パッケージごとに **最も新しい版だけ** を候補にする
+3. 次のものは提案せず、理由を報告に出す: 端末の方が新しい / 未インストール / 分割 APK の一部 / `minSdk` が端末より高い / 読めない
+4. 提案には APK のパス・パッケージ名・versionCode（`versionCodeMajor` 込み）・**SHA-256** を記録する
+5. 実行（承認）時に、もう一度すべて確かめてからインストールする:
+   - SHA-256 が提案時と同じか（提案後に差し替えられていないか）
+   - APK を読み直し、パッケージ名と versionCode が提案と一致するか
+   - 端末の版が、まだ APK より古いか（その間に Play ストアで更新されていないか。ダウングレードはしない）
+6. `pm install -r` の失敗は理由を日本語で示す（署名違い・容量不足・CPU 非対応・分割 APK など）
+7. インストール後に端末の版を読み直し、期待どおりに上がったかを確かめてから記録を更新する
+
+署名が違う APK（別の提供元が作ったもの）は Android 自体が更新を拒否する。このエージェントは署名の偽装や回避はしない。
 
 ### 安全のための設計
 

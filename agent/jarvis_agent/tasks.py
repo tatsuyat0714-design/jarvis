@@ -7,7 +7,7 @@
 
   optimize : キャッシュ削除・バックグラウンドの大きなプロセスの監視        （軽い）
   unused   : 使用履歴（usagestats）から未使用アプリを抽出                  （重い）
-  updates  : インストール済みバージョンの差分、ローカル APK による更新      （重い）
+  updates  : インストール済みバージョンの差分、ローカル APK の検証付き更新  （重い）
   dupes    : 重複ファイル検出と、LLM / 既定ルールによる「残す 1 つ」の判断   （重い）
 """
 
@@ -24,6 +24,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
 
+from . import apk
 from . import dupes as dp
 from .device import SECTIONS, parse_focus, parse_storage, run_sections
 from .llm import LLM
@@ -211,37 +212,57 @@ def unused(ctx: TaskContext) -> Report:
     return rep
 
 
-def _local_apks(apk_dir: str) -> tuple[list[tuple[str, str, int, str]], str | None]:
-    if not os.path.isdir(apk_dir):
-        return [], None
+def _read_local_apk(path: str) -> apk.ApkInfo | None:
+    """まず自前のパーサーで読み、読めなければ aapt があればそれで読む。"""
+    try:
+        return apk.read_apk(path)
+    except apk.ApkError:
+        pass
     tool = shutil.which("aapt") or shutil.which("aapt2")
     if not tool:
-        return [], "APK のバージョン確認には aapt が必要です（pkg install aapt）"
-    out = []
+        return None
+    try:
+        r = subprocess.run([tool, "dump", "badging", path], capture_output=True, text=True,
+                           errors="replace", timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    b = parse_badging(r.stdout)
+    return apk.ApkInfo(b[0], b[1], b[2], None) if b else None
+
+
+def _local_apks(apk_dir: str) -> tuple[dict[str, tuple[str, apk.ApkInfo]], list[str]]:
+    """apk_dir 直下の APK を読み、パッケージごとに最も新しい版だけを残す。"""
+    best: dict[str, tuple[str, apk.ApkInfo]] = {}
+    notes: list[str] = []
+    if not os.path.isdir(apk_dir):
+        return best, notes
     for name in sorted(os.listdir(apk_dir)):
         if not name.endswith(".apk"):
             continue
         path = os.path.join(apk_dir, name)
-        try:
-            r = subprocess.run([tool, "dump", "badging", path], capture_output=True, text=True,
-                               errors="replace", timeout=20)
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        if b := parse_badging(r.stdout):
-            out.append((path, *b))
-    return out, None
+        info = _read_local_apk(path)
+        if info is None:
+            notes.append(f"読めない APK: {name}")
+        elif info.split:
+            notes.append(f"分割 APK の一部のため対象外: {name}（{info.split}）")
+        elif info.package not in best or info.version_code > best[info.package][1].version_code:
+            best[info.package] = (path, info)
+    return best, notes
 
 
 def updates(ctx: TaskContext) -> Report:
     raw = run_sections(ctx.transport, {
         "user": "pm list packages -3",
         "pkgs": "dumpsys package packages | grep -E 'Package \\[|^ *versionCode=|^ *versionName='",
+        "sdk": "getprop ro.build.version.sdk",
     }, timeout=40)
     users = parse_pkg_list(raw.get("user", ""))
     versions = parse_versions(raw.get("pkgs", ""))
     inv = {p: list(v) for p, v in versions.items() if p in users}
     if not inv:
         raise TaskError("バージョン情報を取得できませんでした")
+    sdk_s = raw.get("sdk", "").strip()
+    sdk = int(sdk_s) if sdk_s.isdigit() else None
 
     rep = Report("updates", "")
     prev: dict[str, list] = ctx.store.state.get("inventory", {})
@@ -254,14 +275,26 @@ def updates(ctx: TaskContext) -> Report:
     ctx.store.state["inventory"] = inv
     ctx.store.save()
 
-    apks, note = _local_apks(ctx.cfg["apk_dir"])
-    if note:
-        rep.details.append(note)
-    for path, pkg, code, vname in apks:
-        if pkg in inv and code > inv[pkg][0]:
-            rep.proposals.append(Proposal("install_apk", {"path": path, "package": pkg},
-                                          f"{pkg} を {inv[pkg][1]} → {vname} に更新", "high",
-                                          f"ローカル APK: {os.path.basename(path)}"))
+    apks, notes = _local_apks(ctx.cfg["apk_dir"])
+    rep.details += notes
+    for pkg, (path, info) in sorted(apks.items()):
+        fname = os.path.basename(path)
+        if pkg not in inv:
+            rep.details.append(f"未インストールのため対象外: {fname}（{pkg}）")
+            continue
+        cur_code, cur_name = inv[pkg]
+        if info.version_code <= cur_code:
+            if info.version_code < cur_code:
+                rep.details.append(f"端末の方が新しい: {fname}（{info.version_name} < {cur_name}）")
+            continue
+        if info.min_sdk and sdk and info.min_sdk > sdk:
+            rep.details.append(f"この端末では動かない: {fname}（Android SDK {info.min_sdk} 以上が必要、端末は {sdk}）")
+            continue
+        rep.proposals.append(Proposal(
+            "install_apk",
+            {"path": path, "package": pkg, "version_code": info.version_code, "sha256": apk.sha256(path)},
+            f"{pkg} を {cur_name} → {info.version_name or info.version_code} に更新", "high",
+            f"ローカル APK: {fname}"))
     first = "（初回のため基準を記録）" if not prev else ""
     rep.summary = (f"アプリ {len(inv)} 件{first}: 更新 {len(updated)} / 追加 {len(added)} / 削除 {len(removed)}"
                    f"、ローカル APK で更新可能 {len(rep.proposals)} 件")
@@ -364,16 +397,73 @@ def apply(p: Proposal, ctx: TaskContext) -> str:
             raise ApplyError(f"アンインストール失敗: {res.stdout.strip() or res.stderr.strip()}")
         return f"{pkg} をアンインストールしました"
     if k == "install_apk":
-        path = str(a.get("path", ""))
-        if not (path.endswith(".apk") and _under(path, [ctx.cfg["apk_dir"]])):
-            raise ApplyError(f"apk_dir 外の APK は扱いません: {path}")
-        res = t.shell(f"pm install -r {shlex.quote(path)}", timeout=120)
-        if "Success" not in res.stdout:
-            raise ApplyError(f"インストール失敗: {res.stdout.strip() or res.stderr.strip()}")
-        return f"{a.get('package', path)} を更新しました"
+        return _apply_install(a, ctx)
     if k == "trash":
         return _apply_trash(a, ctx)
     raise ApplyError(f"未知の提案: {k}")
+
+
+# pm install の失敗コード → 利用者向けの説明
+_INSTALL_ERRORS = {
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE": "署名が端末のアプリと違います（提供元が違う APK の可能性）",
+    "INSTALL_FAILED_VERSION_DOWNGRADE": "端末の版より古い APK です",
+    "INSTALL_FAILED_OLDER_SDK": "この端末の Android のバージョンでは動きません",
+    "INSTALL_FAILED_INSUFFICIENT_STORAGE": "空き容量が足りません",
+    "INSTALL_FAILED_NO_MATCHING_ABIS": "この端末の CPU 向けの APK ではありません",
+    "INSTALL_FAILED_MISSING_SPLIT": "分割 APK の一部しかありません（全体が必要）",
+    "INSTALL_PARSE_FAILED_NO_CERTIFICATES": "APK に署名がありません",
+}
+
+
+def explain_install_error(output: str) -> str:
+    m = re.search(r"(INSTALL_[A-Z_]+)", output)
+    if not m:
+        return output.strip() or "不明なエラー"
+    code = m.group(1)
+    hint = _INSTALL_ERRORS.get(code) or ("APK が壊れています" if code.startswith("INSTALL_PARSE_FAILED") else "")
+    return f"{hint}（{code}）" if hint else code
+
+
+def _installed_version(ctx: TaskContext, pkg: str) -> int | None:
+    out = ctx.transport.shell(f"dumpsys package {pkg} | grep -m1 -E '^ *versionCode='").stdout
+    m = re.search(r"versionCode=(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def _apply_install(a: dict, ctx: TaskContext) -> str:
+    path = str(a.get("path", ""))
+    if not (path.endswith(".apk") and _under(path, [ctx.cfg["apk_dir"]])):
+        raise ApplyError(f"apk_dir 外の APK は扱いません: {path}")
+    if not a.get("sha256"):
+        raise ApplyError("古い形式の提案です。task updates をやり直してください")
+    pkg = _need_pkg(a)
+    # 提案を作った後に APK が差し替えられていないか、中身を読み直して確かめる
+    try:
+        if apk.sha256(path) != a["sha256"]:
+            raise ApplyError("提案を作った後に APK が変わっています。task updates をやり直してください")
+        info = apk.read_apk(path)
+    except OSError as e:
+        raise ApplyError(f"APK が読めません: {path}") from e
+    except apk.ApkError as e:
+        raise ApplyError(str(e)) from e
+    if info.package != pkg or info.version_code != a.get("version_code"):
+        raise ApplyError("APK の中身が提案と一致しません")
+    _need_user_app(ctx, pkg)
+    before = _installed_version(ctx, pkg)
+    if before is not None and before >= info.version_code:
+        raise ApplyError(f"{pkg} は既に同じか新しい版です")
+
+    res = ctx.transport.shell(f"pm install -r {shlex.quote(path)}", timeout=120)
+    if "Success" not in res.stdout:
+        raise ApplyError("インストール失敗: " + explain_install_error(res.stdout + res.stderr))
+    after = _installed_version(ctx, pkg)
+    if after != info.version_code:
+        raise ApplyError(f"インストール後の版が想定と違います（{after} / 期待 {info.version_code}）")
+    inv = ctx.store.state.setdefault("inventory", {})
+    old_name = inv.get(pkg, [None, "?"])[1]
+    inv[pkg] = [info.version_code, info.version_name]
+    ctx.store.save()
+    return f"{pkg} を {old_name} → {info.version_name or info.version_code} に更新しました"
 
 
 def _apply_trash(a: dict, ctx: TaskContext) -> str:
