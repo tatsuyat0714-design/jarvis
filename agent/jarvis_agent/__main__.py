@@ -12,6 +12,8 @@
                                                  承認待ちの提案を表示（--apply で確認しながら実行）
   python -m jarvis_agent trash list|restore ID|purge [--days N]
                                                  重複整理のゴミ箱の一覧・復元・完全削除
+  python -m jarvis_agent restricted [list|undo PKG|undo all]
+                                                 optimize でバックグラウンドを制限したアプリの一覧・解除
   python -m jarvis_agent events [--poll]         イベントを表示するだけ（トリガーの動作確認）
   python -m jarvis_agent daemon [--poll]         イベント駆動で常駐し、ルールに従ってタスクを実行
 
@@ -36,7 +38,7 @@ from .context import build_messages, render
 from .device import DeviceProbe, build_script
 from .llm import DEFAULT_URL, EchoLLM, LLMError, LocalLLM
 from .store import Store
-from .tasks import TASKS, ApplyError, Proposal, TaskContext, TaskError, apply, run_task
+from .tasks import TASKS, ApplyError, Proposal, TaskContext, TaskError, apply, run_task, unrestrict
 from .transport import FakeTransport, TransportError, WrapperTransport
 
 
@@ -191,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     pg = trs.add_parser("purge")
     pg.add_argument("--days", type=float, default=30, help="この日数より古いバッチを完全に削除（既定 30）")
 
+    rt = sub.add_parser("restricted")
+    rts = rt.add_subparsers(dest="restricted_cmd")
+    rts.add_parser("list")
+    ru = rts.add_parser("undo")
+    ru.add_argument("package", help="パッケージ名、または all")
+
     for name in ("events", "daemon"):
         d = sub.add_parser(name)
         d.add_argument("--poll", action="store_true", help="logcat を使わずポーリングで監視")
@@ -202,6 +210,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "trash":
             return trash_cmd(args, Store())
+
+        if args.cmd == "restricted":
+            store = Store()
+            recs = store.state.get("restricted", {})
+            if args.restricted_cmd != "undo":
+                if not recs:
+                    print("制限中のアプリはありません")
+                for pkg, r in sorted(recs.items()):
+                    when = time.strftime("%Y-%m-%d", time.localtime(r.get("t", 0)))
+                    print(f"{pkg}  {when} から制限中（元のバケット {r.get('prev')}）")
+                return 0
+            ctx = TaskContext(transport, store)
+            targets = sorted(recs) if args.package == "all" else [args.package]
+            rc = 0
+            for pkg in targets:
+                try:
+                    print(unrestrict(pkg, ctx))
+                except ApplyError as e:
+                    print(f"失敗: {e}", file=sys.stderr)
+                    rc = 1
+            return rc
 
         if args.cmd in ("task", "pending", "daemon"):
             store = Store()

@@ -72,6 +72,8 @@ DEVICE_TABLE = {
     "ps -A": PS,
     "df /data": "/dev/block/dm-48  115206272 61834532  53240284  54% /data",
     "dumpsys activity": "  topResumedActivity=ActivityRecord{1 u0 com.android.chrome/.Main t1}",
+    "dumpsys diskstats": 'App Cache Size: 2147483648\nPackage Names: ["com.android.chrome","jp.naver.line.android"]\nCache Sizes: [1610612736,536870912]',
+    "/proc/meminfo": "MemTotal:        7814036 kB\nMemFree:          112504 kB\nMemAvailable:     560112 kB",
     "pm uninstall": "Success",
     "pm install": "Success",
 }

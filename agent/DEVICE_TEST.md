@@ -290,7 +290,12 @@ python -m jarvis_agent pending
 ```
 
 **確認すること**
-- [ ] optimize: 空き容量と、裏で大きくメモリを使っているアプリが出る。提案に「全アプリのキャッシュを削除」
+- [ ] optimize: 空きメモリ・キャッシュ合計・キャッシュの多いアプリ・裏で動くアプリが出る
+  - キャッシュ削除は、キャッシュ合計が 500MB 以上かストレージ使用率 85% 以上のときだけ提案される
+  - ホームアプリ・キーボード・Termux が終了候補に **出ない** こと
+  - 「キャッシュ合計」が出ない場合は `dumpsys diskstats` がまだ集計されていない（新しい端末では 1 日ほどかかる）。
+    `bin/adbw.sh shell "dumpsys diskstats | head -n 20"` の出力を報告する
+- [ ] optimize を 1 時間おきに 3 回実行すると、裏でずっと 300MB 以上使っているアプリに「（常習）」が付き、終了の提案が出る
 - [ ] unused: 「N 日以上未使用」のアプリが、実際にしばらく使っていないアプリになっている
   - 最近使ったアプリ・入れたばかりのアプリ・Termux / Shizuku が **含まれていない**こと（含まれていたら報告）
 - [ ] updates: 1 回目は「初回のため基準を記録」。どれかのアプリを Play ストアで更新してからもう一度実行すると `更新: <パッケージ> 旧 → 新` が出る
@@ -414,7 +419,15 @@ python -c "import json,pathlib; p=pathlib.Path.home()/'.jarvis/state.json'; d=js
 ## ステップ 9. 提案の実行（pending --apply）
 
 ステップ 7 で保存した提案を、1 件ずつ確認しながら実行する。
-**「全アプリのキャッシュを削除」だけ `y`、それ以外（アンインストール・終了）は `N`** と答える。
+**「全アプリのキャッシュを削除」だけ `y`、それ以外（アンインストール・終了・制限）は `N`** と答える。
+
+キャッシュ削除の提案が出ていない（キャッシュが少ない）場合は、一時的にしきい値を下げて提案を作る:
+
+```sh
+echo '{"cache_min_mb": 0}' > ~/.jarvis/config.json
+python -m jarvis_agent task optimize --save
+rm ~/.jarvis/config.json
+```
 
 ```sh
 python -m jarvis_agent pending --apply
@@ -439,7 +452,7 @@ python -m jarvis_agent daemon
 
 | 操作 | 期待するログ / 通知 |
 |---|---|
-| 画面 OFF | `event screen_off` → `task optimize: …（承認待ち +N）`、通知「ジャービス: optimize」 |
+| 画面 OFF | `event screen_off` → `task optimize: …`（提案があれば `承認待ち +N` と通知「ジャービス: optimize」） |
 | 画面 ON | `event screen_on`、通知「承認待ちの提案が N 件あります」 |
 | 画面 ON のまま充電ケーブルを挿す | `rule charging-maintenance: 画面 ON のため OFF まで先送り` |
 | そのまま画面 OFF | `task updates` / `task unused` / `task dupes` が順に実行される |
