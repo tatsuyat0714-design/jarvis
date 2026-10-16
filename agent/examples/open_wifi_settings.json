@@ -1,0 +1,5 @@
+[
+  {"action": "launch", "target": "com.android.settings", "expect": "ネットワーク"},
+  {"action": "tap", "target": "ネットワークとインターネット", "expect": "Wi-Fi"},
+  {"action": "tap", "target": "Wi-Fi"}
+]

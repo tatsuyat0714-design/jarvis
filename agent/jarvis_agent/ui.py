@@ -12,9 +12,11 @@ import hashlib
 import io
 import re
 import shlex
+import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from .transport import Transport
 
@@ -46,6 +48,9 @@ class UiNode:
     enabled: bool
     editable: bool
     password: bool
+    checkable: bool = False
+    checked: bool = False
+    scrollable: bool = False
 
     @property
     def center(self) -> tuple[int, int]:
@@ -61,6 +66,8 @@ class UiNode:
         """LLM・ログ向けの短い表記。"""
         name = (self.text or self.desc or self.inner or self.hint
                 or self.resource_id.rsplit("/", 1)[-1] or self.cls.rsplit(".", 1)[-1])
+        if self.checkable:
+            return f"スイッチ「{name}」{'ON' if self.checked else 'OFF'}"
         kind = "入力欄" if self.editable else ("ボタン" if self.clickable else "表示")
         return f"{kind}「{name}」"
 
@@ -89,6 +96,9 @@ def _to_node(a: dict[str, str], inner: str) -> UiNode | None:
         enabled=a.get("enabled", "true") == "true",
         editable=cls.endswith("EditText"),
         password=password,
+        checkable=a.get("checkable") == "true",
+        checked=a.get("checked") == "true",
+        scrollable=a.get("scrollable") == "true",
     )
 
 
@@ -110,27 +120,44 @@ def iter_nodes(xml: str) -> Iterator[UiNode]:
         raise UiError(f"UI ダンプの XML が壊れています: {e}") from e
 
 
-def _haystack(a: UiNode) -> str:
-    return " ".join((a.text, a.desc, a.inner, a.hint, a.resource_id)).lower()
+def normalize(s: str) -> str:
+    """全角・半角、大文字・小文字、空白の違いを吸収する（「Ｗｉ－Ｆｉ」と「wi-fi」を同じに扱う）。"""
+    return " ".join(unicodedata.normalize("NFKC", s).casefold().split())
+
+
+def match_score(n: UiNode, kw: str) -> int | None:
+    """小さいほど良い一致。0: 文言と完全一致 / 1: 文言の先頭 / 2: 文言に含む / 3: resource-id に含む。"""
+    texts = [normalize(t) for t in (n.text, n.desc, n.inner, n.hint) if t]
+    if any(t == kw for t in texts):
+        return 0
+    if any(t.startswith(kw) for t in texts):
+        return 1
+    if any(kw in t for t in texts):
+        return 2
+    if kw in normalize(n.resource_id):
+        return 3
+    return None
 
 
 def find(xml: str, keywords: Iterable[str], clickable: bool | None = None,
-         editable: bool | None = None) -> list[UiNode]:
-    """いずれかのキーワードを含むノードを返す（小さい要素ほど具体的なので面積の昇順）。"""
-    kws = [k.lower() for k in keywords if k]
+         editable: bool | None = None, checkable: bool | None = None) -> list[UiNode]:
+    """いずれかのキーワードに一致するノードを、一致の良い順（同じなら小さい要素＝具体的な順）に返す。"""
+    kws = [normalize(k) for k in keywords if k and normalize(k)]
     if not kws:
         return []
-    hits = []
+    scored = []
     for n in iter_nodes(xml):
         if clickable is not None and n.clickable != clickable:
             continue
         if editable is not None and n.editable != editable:
             continue
-        hay = _haystack(n)
-        if any(k in hay for k in kws):
-            hits.append(n)
-    hits.sort(key=lambda n: n.area)
-    return hits
+        if checkable is not None and n.checkable != checkable:
+            continue
+        scores = [s for k in kws if (s := match_score(n, k)) is not None]
+        if scores:
+            scored.append((min(scores), n.area, n))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [n for _, _, n in scored]
 
 
 def summarize(xml: str, limit: int = 25) -> tuple[str, str]:
@@ -138,13 +165,26 @@ def summarize(xml: str, limit: int = 25) -> tuple[str, str]:
     h = hashlib.sha256()
     pkg = ""
     lines: list[str] = []
+    scrollable = False
     for n in iter_nodes(xml):
         pkg = pkg or n.package
-        h.update(f"{n.text}|{n.desc}|{n.resource_id}|{n.bounds}".encode())
-        if (n.clickable or n.editable) and n.enabled and len(lines) < limit:
+        # スイッチの ON/OFF も画面の変化として数える（切り替えたのに「変化なし」にならないように）
+        h.update(f"{n.text}|{n.desc}|{n.resource_id}|{n.bounds}|{n.checked}".encode())
+        scrollable = scrollable or n.scrollable
+        if (n.clickable or n.editable or n.checkable) and n.enabled and len(lines) < limit:
             lines.append(f"- {n.label()}")
     head = f"[screen] {pkg}" if pkg else "[screen]"
+    if scrollable:
+        lines.append("（スクロールすると続きがある一覧あり）")
     return head + "\n" + "\n".join(lines), h.hexdigest()[:16]
+
+
+def screen_package(xml: str) -> str:
+    """前面の画面のパッケージ名（最初に見つかった要素のもの）。"""
+    for n in iter_nodes(xml):
+        if n.package:
+            return n.package
+    return ""
 
 
 # ---------------------------------------------------------------- device I/O
@@ -163,6 +203,65 @@ def dump(transport: Transport, timeout: float = 8.0) -> str:
 
 def tap(transport: Transport, x: int, y: int) -> None:
     transport.shell(f"input tap {int(x)} {int(y)}")
+
+
+def swipe(transport: Transport, x1: int, y1: int, x2: int, y2: int, ms: int = 300) -> None:
+    transport.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(ms)}")
+
+
+def scroll(transport: Transport, xml: str, direction: str = "down") -> bool:
+    """いちばん大きいスクロール可能な一覧の中でスワイプする。一覧が無ければ False。
+    down = 続き（下）を見る（指は下から上へ動かす）。"""
+    if direction not in ("down", "up"):
+        raise UiError(f"不正なスクロール方向: {direction}")
+    lists = sorted((n for n in iter_nodes(xml) if n.scrollable), key=lambda n: -n.area)
+    if not lists:
+        return False
+    l, t, r, b = lists[0].bounds
+    x = (l + r) // 2
+    hi, lo = t + (b - t) * 3 // 4, t + (b - t) // 4
+    if direction == "down":
+        swipe(transport, x, hi, x, lo)
+    else:
+        swipe(transport, x, lo, x, hi)
+    return True
+
+
+def find_scrolling(transport: Transport, xml: str, keywords: list[str], max_swipes: int = 4,
+                   sleep: Callable[[float], None] = time.sleep, **filters) -> tuple[UiNode | None, str]:
+    """画面に無ければ一覧を下へスクロールしながら探す。端まで来たら（画面が変わらなくなったら）やめる。"""
+    for i in range(max_swipes + 1):
+        hits = [n for n in find(xml, keywords, **filters) if n.enabled]
+        if hits:
+            return hits[0], xml
+        if i == max_swipes:
+            break
+        before = summarize(xml)[1]
+        if not scroll(transport, xml, "down"):
+            break
+        sleep(0.4)
+        xml = dump(transport)
+        if summarize(xml)[1] == before:
+            break
+    return None, xml
+
+
+def wait_for(transport: Transport, keywords: list[str], timeout: float = 5.0, interval: float = 0.5,
+             sleep: Callable[[float], None] = time.sleep) -> tuple[UiNode, str]:
+    """要素が現れるまで画面を取り直して待つ（読み込み中の画面など）。
+    dump 自体にも時間がかかるので、待ち時間は「interval ごとに最大 timeout/interval 回取り直す」で数える。"""
+    polls = max(1, int(timeout / interval))
+    for i in range(polls + 1):
+        try:
+            xml = dump(transport)
+            hits = [n for n in find(xml, keywords) if n.enabled]
+            if hits:
+                return hits[0], xml
+        except UiError:
+            pass  # アニメーション中の dump 失敗は待てば直る
+        if i < polls:
+            sleep(interval)
+    raise UiError(f"{timeout:g} 秒待っても「{' / '.join(keywords)}」が現れませんでした")
 
 
 def encode_input_text(text: str) -> str:
