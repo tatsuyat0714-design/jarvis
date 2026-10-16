@@ -51,6 +51,8 @@ python CLI ──> WrapperTransport ──> adbw.sh ──┬─> adb -s 127.0.0
 
 ## セットアップ（Termux）
 
+実機での確認手順は [DEVICE_TEST.md](DEVICE_TEST.md) にまとめている。
+
 ```sh
 pkg install python android-tools git termux-api aapt
 termux-setup-storage   # 重複検出で /sdcard を読むため
