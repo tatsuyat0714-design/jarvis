@@ -5,7 +5,7 @@
 (種類, 引数) の構造データで、apply() 側で引数を検証してからコマンドを組み立てる。
 保存された承認待ちの提案ファイルが書き換えられても、任意のコマンドは実行されない。
 
-  optimize : キャッシュ削除・バックグラウンドの大きなプロセスの監視        （軽い）
+  optimize : キャッシュ・メモリ・裏で常習的に重いアプリの監視と、終了・制限      （軽い）
   unused   : 使用履歴（usagestats）から未使用アプリを抽出                  （重い）
   updates  : インストール済みバージョンの差分、ローカル APK の検証付き更新  （重い）
   dupes    : 重複ファイル検出と、LLM / 既定ルールによる「残す 1 つ」の判断   （重い）
@@ -27,7 +27,7 @@ from typing import Callable
 from . import apk
 from . import dupes as dp
 from . import trash
-from .device import SECTIONS, parse_focus, parse_storage, run_sections
+from .device import SECTIONS, parse_focus, parse_meminfo, parse_storage, run_sections
 from .llm import LLM
 from .store import Store
 from .transport import Transport
@@ -150,28 +150,172 @@ def parse_badging(text: str) -> tuple[str, int, str] | None:
 
 # ---------------------------------------------------------------- tasks
 
+_LIST = re.compile(r"\[(.*)\]")
+
+
+def parse_diskstats(text: str) -> tuple[int | None, dict[str, int]]:
+    """dumpsys diskstats の App Cache Size と Package Names / Cache Sizes（システムが 1 日 1 回程度集計）。"""
+    total, names, sizes = None, [], []
+    for line in text.splitlines():
+        key, _, val = line.partition(":")
+        val = val.strip()
+        if key == "App Cache Size" and val.isdigit():
+            total = int(val)
+        elif key in ("Package Names", "Cache Sizes"):
+            try:
+                arr = json.loads(val)
+            except json.JSONDecodeError:
+                continue
+            if key == "Package Names":
+                names = [str(x) for x in arr]
+            else:
+                sizes = [int(x) for x in arr if isinstance(x, (int, float))]
+    per_app = dict(zip(names, sizes)) if len(names) == len(sizes) else {}
+    if total is None and per_app:
+        total = sum(per_app.values())
+    return total, per_app
+
+
+def parse_component_pkg(text: str) -> str | None:
+    """`com.x.y/.Main` や `com.x.y/com.x.y.Ime` から先頭のパッケージ名を取る。"""
+    m = re.search(r"([a-zA-Z]\w*(?:\.\w+)+)/", text)
+    return m.group(1) if m else None
+
+
+def parse_buckets(text: str) -> dict[str, int]:
+    out = {}
+    for line in text.splitlines():
+        pkg, _, val = line.partition("=")
+        m = re.search(r"\d+", val)
+        if m and valid_package(pkg.strip()):
+            out[pkg.strip()] = int(m.group(0))
+    return out
+
+
+BUCKET_RESTRICTED = 45
+_MB = 1024 * 1024
+
+
+def _record_samples(ctx: TaskContext, bg: list[tuple[str, int]]) -> dict[str, list]:
+    """バックグラウンドのメモリ使用量を記録し、古いものを捨てた履歴を返す。"""
+    window = ctx.cfg["bg_window_days"] * 86400
+    hist: dict[str, list] = ctx.store.state.setdefault("bg_samples", {})
+    for pkg, mb in bg[:20]:
+        if mb >= ctx.cfg["bg_rss_mb"] // 2:
+            hist.setdefault(pkg, []).append([ctx.now, mb])
+    for pkg in list(hist):
+        hist[pkg] = [s for s in hist[pkg] if ctx.now - s[0] <= window][-12:]
+        if not hist[pkg]:
+            del hist[pkg]
+    ctx.store.save()
+    return hist
+
+
+def _chronic(ctx: TaskContext, hist: dict[str, list]) -> set[str]:
+    th = ctx.cfg["bg_rss_mb"]
+    return {p for p, samples in hist.items()
+            if sum(1 for _, mb in samples if mb >= th) >= ctx.cfg["bg_chronic_count"]}
+
+
 def optimize(ctx: TaskContext) -> Report:
     raw = run_sections(ctx.transport, {
         "df": "df /data | tail -n 1",
         "ps": "ps -A -o RSS,NAME | sort -rn | head -n 40",
         "user": "pm list packages -3",
         "focus": SECTIONS["focus"],
-    })
+        "mem": "head -n 3 /proc/meminfo",
+        "sdk": "getprop ro.build.version.sdk",
+        "home": "cmd package resolve-activity --brief -a android.intent.action.MAIN "
+                "-c android.intent.category.HOME | tail -n 1",
+        "ime": "settings get secure default_input_method",
+        "disk": "dumpsys diskstats | grep -E '^(App Cache Size|Package Names|Cache Sizes):'",
+    }, timeout=30)
+    cfg = ctx.cfg
     storage = parse_storage(raw.get("df", ""))
+    mem = parse_meminfo(raw.get("mem", ""))
+    sdk_s = raw.get("sdk", "").strip()
+    sdk = int(sdk_s) if sdk_s.isdigit() else None
     fg = parse_focus(raw.get("focus", "")).get("package")
     users = parse_pkg_list(raw.get("user", ""))
     rss = parse_ps(raw.get("ps", ""))
-    bg = sorted(((p, mb) for p, mb in rss.items() if p in users and p != fg), key=lambda x: -x[1])
-    heavy = [(p, mb) for p, mb in bg if mb >= ctx.cfg["bg_rss_mb"]]
+    cache_total, cache_per_app = parse_diskstats(raw.get("disk", ""))
+
+    # 止めると使い勝手が壊れるもの: 前面アプリ・ホーム・キーボード・エージェント自身と設定で除外したもの
+    exclude = {fg, parse_component_pkg(raw.get("home", "")), parse_component_pkg(raw.get("ime", "")),
+               *cfg["unused_ignore"], *cfg["optimize_ignore"]} - {None}
+    bg = sorted(((p, mb) for p, mb in rss.items() if p in users and p not in exclude), key=lambda x: -x[1])
+    hist = _record_samples(ctx, bg)
+    chronic = _chronic(ctx, hist)
+
+    rep = Report("optimize", "")
+    det = rep.details
+
+    # ---- メモリ
+    pressure = False
+    if mem["total_mb"] and mem["available_mb"] is not None:
+        pct = mem["available_mb"] * 100 // mem["total_mb"]
+        pressure = pct < cfg["mem_low_pct"]
+        det.append(f"メモリ: 空き {mem['available_mb']}MB / {mem['total_mb']}MB（{pct}%）"
+                   + ("・不足気味" if pressure else ""))
+    th = cfg["bg_rss_mb"]
+    for p, mb in bg:
+        if mb < th:
+            break
+        why = []
+        if p in chronic:
+            why.append(f"直近 {cfg['bg_window_days']} 日で {len(hist.get(p, []))} 回、裏で大きく使用")
+        if pressure:
+            why.append("メモリ不足")
+        if why:
+            rep.proposals.append(Proposal("kill_bg", {"package": p}, f"{p} のバックグラウンドプロセスを終了",
+                                          "low", f"{mb}MB・" + "・".join(why)))
+    det += [f"裏で使用中: {p} {mb}MB" + ("（常習）" if p in chronic else "") for p, mb in bg[:5]]
+
+    # ---- 常習的に裏で重いのに、ほとんど使われていないアプリは「制限」バケットを提案（Android 12 以降）
+    restricted: dict[str, dict] = ctx.store.state.get("restricted", {})
+    cands = sorted(p for p in chronic
+                   if p in users and p not in exclude and p not in restricted and valid_package(p))
+    if cands and sdk and sdk >= 31:
+        raw2 = run_sections(ctx.transport, {
+            "usage": "dumpsys usagestats | grep -oE 'package=[^ ]+ totalTimeUsed=\"[^\"]*\" lastTimeUsed=\"[^\"]*\"'",
+            "bucket": "for p in " + " ".join(cands) + "; do echo \"$p=$(am get-standby-bucket $p)\"; done",
+        }, timeout=40)
+        usage = parse_usage(raw2.get("usage", ""))
+        buckets = parse_buckets(raw2.get("bucket", ""))
+        cutoff = ctx.now - cfg["restrict_unused_days"] * 86400
+        for p in cands:
+            b = buckets.get(p)
+            last = usage.get(p)
+            # 使用履歴が読めないアプリは判断材料が無いので提案しない
+            if b is None or b >= BUCKET_RESTRICTED or not usage or (last and last > cutoff):
+                continue
+            ago = f"{int((ctx.now - last) // 86400)}日間開いていない" if last else "使用記録なし"
+            rep.proposals.append(Proposal(
+                "restrict_bg", {"package": p}, f"{p} のバックグラウンド動作を制限",
+                "high", f"常習的に裏で重い・{ago}。通知や同期が遅れることがある（restricted undo で戻せる）"))
+    if restricted:
+        det.append(f"制限中のアプリ: {', '.join(sorted(restricted))}")
+
+    # ---- キャッシュ: 大きいとき・空きが少ないときだけ提案する
+    low_storage = storage["used_pct"] is not None and storage["used_pct"] >= cfg["storage_low_pct"]
+    if cache_total is not None:
+        det.append(f"キャッシュ合計: {cache_total / _MB:.0f}MB（システムの集計値）")
+        top = sorted(cache_per_app.items(), key=lambda x: -x[1])[:5]
+        det += [f"キャッシュ: {p} {sz / _MB:.0f}MB" for p, sz in top if sz >= 10 * _MB]
+    big_cache = cache_total is not None and cache_total >= cfg["cache_min_mb"] * _MB
+    if big_cache or low_storage:
+        why = []
+        if big_cache:
+            why.append(f"キャッシュ {cache_total / _MB:.0f}MB")
+        if low_storage:
+            why.append(f"ストレージ使用率 {storage['used_pct']}%")
+        rep.proposals.append(Proposal("trim_caches", {}, "全アプリのキャッシュを削除", "low", "・".join(why)))
 
     free = f"空き {storage['free_gb']}GB、" if storage["free_gb"] is not None else ""
-    rep = Report("optimize", f"{free}バックグラウンドの大きなアプリ {len(heavy)} 件")
-    rep.details = [f"{p}: {mb}MB" for p, mb in bg[:5]]
-    used = f"ストレージ使用率 {storage['used_pct']}%" if storage["used_pct"] is not None else ""
-    rep.proposals.append(Proposal("trim_caches", {}, "全アプリのキャッシュを削除", "low", used))
-    for p, mb in heavy:
-        rep.proposals.append(Proposal("kill_bg", {"package": p}, f"{p} のバックグラウンドプロセスを終了",
-                                      "low", f"{mb}MB 使用中・前面ではない"))
+    n_kill = sum(1 for p in rep.proposals if p.kind == "kill_bg")
+    n_res = sum(1 for p in rep.proposals if p.kind == "restrict_bg")
+    rep.summary = (f"{free}終了候補 {n_kill} 件・制限候補 {n_res} 件"
+                   f"・キャッシュ削除{'を提案' if any(p.kind == 'trim_caches' for p in rep.proposals) else 'は不要'}")
     return rep
 
 
@@ -400,6 +544,8 @@ def apply(p: Proposal, ctx: TaskContext) -> str:
         _need_user_app(ctx, pkg)
         t.shell(f"am kill {pkg}")
         return f"{pkg} のバックグラウンドプロセスを終了しました"
+    if k == "restrict_bg":
+        return _apply_restrict(a, ctx)
     if k == "uninstall":
         pkg = _need_pkg(a)
         _need_user_app(ctx, pkg)
@@ -412,6 +558,51 @@ def apply(p: Proposal, ctx: TaskContext) -> str:
     if k == "trash":
         return _apply_trash(a, ctx)
     raise ApplyError(f"未知の提案: {k}")
+
+
+def _get_bucket(ctx: TaskContext, pkg: str) -> int | None:
+    m = re.search(r"\d+", ctx.transport.shell(f"am get-standby-bucket {pkg}").stdout)
+    return int(m.group(0)) if m else None
+
+
+def _apply_restrict(a: dict, ctx: TaskContext) -> str:
+    pkg = _need_pkg(a)
+    _need_user_app(ctx, pkg)
+    if pkg in ctx.cfg["unused_ignore"] or pkg in ctx.cfg["optimize_ignore"]:
+        raise ApplyError(f"{pkg} は除外設定に入っています")
+    prev = _get_bucket(ctx, pkg)
+    if prev is None:
+        raise ApplyError("現在のバケットを読めませんでした（Android 12 以降が必要）")
+    if prev >= BUCKET_RESTRICTED:
+        raise ApplyError(f"{pkg} は既に制限されています")
+    ctx.transport.shell(f"am set-standby-bucket {pkg} restricted")
+    if _get_bucket(ctx, pkg) != BUCKET_RESTRICTED:
+        raise ApplyError("制限を設定できませんでした")
+    ctx.store.state.setdefault("restricted", {})[pkg] = {"prev": prev, "t": ctx.now}
+    ctx.store.save()
+    return f"{pkg} のバックグラウンド動作を制限しました（元に戻す: restricted undo {pkg}）"
+
+
+_RESTORABLE_BUCKETS = {5, 10, 20, 30, 40}
+
+
+def unrestrict(pkg: str, ctx: TaskContext) -> str:
+    """restrict_bg を取り消す。利用者がアプリを開いて既にバケットが上がっていれば記録を消すだけ。"""
+    rec = ctx.store.state.get("restricted", {}).get(pkg)
+    if rec is None:
+        raise ApplyError(f"{pkg} はこのエージェントが制限したアプリではありません")
+    if not valid_package(pkg):
+        raise ApplyError(f"不正なパッケージ名: {pkg!r}")
+    cur = _get_bucket(ctx, pkg)
+    msg = f"{pkg} は既に制限が外れていました（記録を消しました）"
+    if cur is not None and cur >= BUCKET_RESTRICTED:
+        prev = rec.get("prev")
+        prev = prev if prev in _RESTORABLE_BUCKETS else 40
+        ctx.transport.shell(f"am set-standby-bucket {pkg} {prev}")
+        msg = f"{pkg} の制限を解除しました"
+    del ctx.store.state["restricted"][pkg]
+    ctx.store.save()
+    return msg
 
 
 # pm install の失敗コード → 利用者向けの説明

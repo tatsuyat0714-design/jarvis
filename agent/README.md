@@ -204,10 +204,34 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
 
 | タスク | 調べること | 提案（リスク） |
 |---|---|---|
-| optimize | 空き容量、`ps` の RSS 上位（前面アプリ・システムを除くユーザーアプリ） | `pm trim-caches`（低）、300MB 以上のバックグラウンドアプリを `am kill`（低） |
+| optimize | 空きメモリ・空き容量、アプリごとのキャッシュ（`dumpsys diskstats`）、裏で動くアプリのメモリ（履歴を記録） | キャッシュ削除（低）、常習的に重いアプリの終了（低）、ほとんど使わない常習アプリのバックグラウンド制限（高）。詳細は下記 |
 | unused | `dumpsys usagestats` の全期間から最終使用日時、候補だけ `firstInstallTime` | 30 日以上未使用のアプリをアンインストール（高）。インストール直後のアプリと Termux / Shizuku は除外 |
 | updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。詳細は下記 |
 | dupes | サイズ → 先頭 64KiB の SHA-256 → 全体の SHA-256。ハッシュはキャッシュ | 残す 1 つ以外をゴミ箱へ移動（高） |
+
+### アプリ最適化（optimize）
+
+1 回の shell 呼び出しで、ストレージ・メモリ・プロセスごとのメモリ・アプリごとのキャッシュ・前面アプリ・
+ホームアプリ・キーボードをまとめて取得する。
+
+- **触らないアプリ**: 前面アプリ・ホームアプリ・キーボード（止めると操作できなくなる）、`unused_ignore`（Termux・Shizuku 等）、
+  `optimize_ignore`
+- **キャッシュ削除** は、キャッシュ合計が `cache_min_mb`（500MB）以上か、ストレージ使用率が `storage_low_pct`（85%）以上の
+  ときだけ提案する（毎回出すと承認待ちが埋まるため）。キャッシュの多いアプリ上位 5 件も報告する
+- **バックグラウンドの監視**: 実行のたびに、裏で動くユーザーアプリのメモリ使用量を記録する（`bg_samples`、直近 `bg_window_days` 日）。
+  `bg_rss_mb`（300MB）以上を `bg_chronic_count`（3）回以上記録したアプリを「常習」とする
+- **終了（`am kill`）** を提案するのは、常習のアプリか、空きメモリが `mem_low_pct`（10%）を切っているときの重いアプリだけ
+  （その時たまたま大きかっただけのアプリは止めない）
+- **バックグラウンド制限**（Android 12 以降）: 常習で、`restrict_unused_days`（7 日）以上開いていないアプリを
+  スタンバイバケット「restricted」にする提案（高リスク: 通知や同期が遅れることがある）。
+  - 実行前のバケットを記録し、`restricted undo <パッケージ>` / `restricted undo all` で戻せる
+  - 利用者がそのアプリを開くとシステムが自動で制限を外す。その場合 undo は記録を消すだけ
+  - 使用履歴が読めないときは提案しない
+
+```sh
+python -m jarvis_agent restricted              # このエージェントが制限したアプリの一覧
+python -m jarvis_agent restricted undo all     # すべて元に戻す
+```
 
 ### 重複ファイル整理（dupes）
 
@@ -280,6 +304,13 @@ LLM には保護されたファイルに `[保護]` を付けて見せる。
   "unused_ignore": ["com.termux", "moe.shizuku.privileged.api"],
   "apk_dir": "/sdcard/Download",
   "bg_rss_mb": 300,
+  "bg_window_days": 3,
+  "bg_chronic_count": 3,
+  "mem_low_pct": 10,
+  "restrict_unused_days": 7,
+  "cache_min_mb": 500,
+  "storage_low_pct": 85,
+  "optimize_ignore": [],
   "auto_apply_low_risk": false
 }
 ```

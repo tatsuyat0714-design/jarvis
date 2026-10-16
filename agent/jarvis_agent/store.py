@@ -31,7 +31,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "unused_ignore": ["com.termux", "com.termux.api", "com.termux.boot", "moe.shizuku.privileged.api",
                       "com.tatsuya.jarvis"],
     "apk_dir": "/sdcard/Download",
+    # optimize: この MB 以上をバックグラウンドで使うアプリを「重い」とみなす
     "bg_rss_mb": 300,
+    # bg_window_days 日のうち bg_chronic_count 回以上重かったアプリを「常習」とする
+    "bg_window_days": 3,
+    "bg_chronic_count": 3,
+    # 空きメモリがこの % を下回ったら、常習でなくても重いアプリの終了を提案する
+    "mem_low_pct": 10,
+    # 常習で、この日数開いていないアプリにバックグラウンド制限を提案する
+    "restrict_unused_days": 7,
+    # キャッシュ合計がこの MB 以上、またはストレージ使用率がこの % 以上のときだけキャッシュ削除を提案する
+    "cache_min_mb": 500,
+    "storage_low_pct": 85,
+    # optimize で触らないアプリ（unused_ignore に加えて）
+    "optimize_ignore": [],
     # 低リスクの提案（キャッシュ削除・バックグラウンドプロセス終了）を無人時に自動実行するか
     "auto_apply_low_risk": False,
 }
