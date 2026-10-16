@@ -137,7 +137,9 @@ class AgentTest(unittest.TestCase):
     def test_dump_reused_between_verify_and_observe(self):
         dev = Screens([XML, XML.replace("Chrome", "LINE")])
         make_agent(dev, [Action("tap", "戻る")]).run("x")
-        self.assertEqual(sum("uiautomator" in c for c in dev.t.calls), 2)
+        # 最初の観測 1 回 + 操作後の安定確認 2 回（変化した → もう一度取って同じなら落ち着いた）。
+        # 次の OBSERVE は安定確認のダンプを流用するので増えない
+        self.assertEqual(sum("uiautomator" in c for c in dev.t.calls), 3)
 
     def test_prefers_clickable_parent_over_label(self):
         dev = Screens([XML, XML])

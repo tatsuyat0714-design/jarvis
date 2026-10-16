@@ -5,7 +5,9 @@
   python -m jarvis_agent capture out.txt         生の取得結果を保存（パーサの不具合報告・テスト用）
   python -m jarvis_agent ui screen               今の画面の操作可能な要素を一覧
   python -m jarvis_agent ui find 設定 [--tap]    キーワードに一致する要素と座標（--tap で最上位をタップ）
-  python -m jarvis_agent run "目標"              ステートマシンで目標達成まで操作（危険な操作は確認）
+  python -m jarvis_agent run "目標" [--app PKG]  ステートマシンで目標達成まで操作（危険な操作は確認。
+                                                 --app を付けるとそのアプリ以外に移った時点で止める）
+  python -m jarvis_agent run --macro steps.json  決まった手順を LLM なしで実行
   python -m jarvis_agent task optimize|unused|updates|dupes [--llm] [--save]
                                                  タスクを実行し、提案を 1 件ずつ確認して実行
   python -m jarvis_agent pending [--apply] [--task NAME] [--dismiss ID|all]
@@ -37,7 +39,7 @@ from . import events as ev
 from . import trash
 from . import ui
 from .dupes import sha256_file
-from .agent import Action, Agent, LLMPlanner, StepLog
+from .agent import Action, Agent, LLMPlanner, PlanError, ScriptedPlanner, StepLog, load_macro
 from .daemon import (DEFAULT_RULES, DaemonError, Dispatcher, ThreadRunner, acquire_lock, apply_overrides,
                      run_forever, write_status_file)
 from .context import build_messages, render
@@ -182,7 +184,8 @@ def status_cmd(store: Store) -> int:
 
 
 def print_log(e: StepLog) -> None:
-    print(f"[{e.state.value:<7}] {e.detail}", file=sys.stderr)
+    ms = f"  ({e.ms:.0f}ms)" if e.ms is not None else ""
+    print(f"[{e.state.value:<7}] {e.detail}{ms}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,9 +215,12 @@ def main(argv: list[str] | None = None) -> int:
     uf.add_argument("--tap", action="store_true")
 
     r = sub.add_parser("run")
-    r.add_argument("goal")
+    r.add_argument("goal", nargs="?", default="")
     r.add_argument("--llm-url", default=DEFAULT_URL)
     r.add_argument("--max-steps", type=int, default=15)
+    r.add_argument("--app", action="append", default=[], metavar="PKG",
+                   help="操作してよいアプリ（複数可）。それ以外に移ったら止める")
+    r.add_argument("--macro", help="決まった手順の JSON（LLM を使わない）")
 
     tk = sub.add_parser("task")
     tk.add_argument("name", choices=sorted(TASKS))
@@ -378,9 +384,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cmd == "run":
-            agent = Agent(transport, LLMPlanner(LocalLLM(args.llm_url, max_tokens=128)),
-                          confirm=ask_confirm, max_steps=args.max_steps, on_log=print_log)
-            state = agent.run(args.goal)
+            if args.macro:
+                steps = load_macro(args.macro)
+                planner = ScriptedPlanner(steps)
+                max_steps = len(steps) + 1
+                # マクロで起動するアプリは、--app を書かなくても操作してよいアプリに含める
+                apps = set(args.app) | {a.target for a in steps if a.type == "launch"}
+            elif args.goal:
+                planner = LLMPlanner(LocalLLM(args.llm_url, max_tokens=128))
+                max_steps, apps = args.max_steps, set(args.app)
+            else:
+                print("目標か --macro を指定してください", file=sys.stderr)
+                return 2
+            for pkg in apps:
+                if not ui.valid_package(pkg):
+                    print(f"不正なパッケージ名: {pkg}", file=sys.stderr)
+                    return 2
+            agent = Agent(transport, planner, confirm=ask_confirm, max_steps=max_steps, on_log=print_log,
+                          allowed_packages=apps or None)
+            state = agent.run(args.goal or f"マクロ {args.macro}")
             print(agent.result or state.value)
             return 0 if state.value == "DONE" else 1
         if args.cmd == "capture":
@@ -413,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except (TransportError, LLMError, ui.UiError, TaskError, trash.TrashError, DaemonError) as e:
+    except (TransportError, LLMError, ui.UiError, TaskError, trash.TrashError, DaemonError, PlanError,
+            OSError, json.JSONDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
