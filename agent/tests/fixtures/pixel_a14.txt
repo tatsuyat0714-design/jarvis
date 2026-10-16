@@ -1,0 +1,40 @@
+@@JARVIS:battery
+Current Battery Service state:
+  AC powered: false
+  USB powered: true
+  Wireless powered: false
+  Dock powered: false
+  Max charging current: 500000
+  status: 2
+  health: 2
+  present: true
+  level: 82
+  scale: 100
+  voltage: 4213
+  temperature: 312
+  technology: Li-ion
+@@JARVIS:power
+  mWakefulness=Awake
+  mIsPowered=true
+@@JARVIS:focus
+  topResumedActivity=ActivityRecord{8c1f2a3 u0 com.android.chrome/com.google.android.apps.chrome.Main t42}
+  mCurrentFocus=Window{51e0d7c u0 com.android.chrome/com.google.android.apps.chrome.Main}
+@@JARVIS:meminfo
+MemTotal:        7814036 kB
+MemFree:          312504 kB
+MemAvailable:    2960112 kB
+@@JARVIS:props
+ro.product.manufacturer=Google
+ro.product.model=Pixel 7
+ro.build.version.release=14
+ro.build.version.sdk=34
+ro.product.cpu.abi=arm64-v8a
+@@JARVIS:storage
+/dev/block/dm-48  115206272 61834532  53240284  54% /data
+@@JARVIS:uptime
+183245.71 712004.11
+@@JARVIS:packages
+87
+@@JARVIS:wifi
+Wi-Fi is enabled
+mWifiInfo SSID: "HomeNet-5G", BSSID: aa:bb:cc:dd:ee:ff, MAC: 02:00:00:00:00:00, Supplicant state: COMPLETED
