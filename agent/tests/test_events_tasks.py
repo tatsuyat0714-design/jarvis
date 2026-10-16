@@ -64,6 +64,7 @@ def sectioned(table: dict[str, str]):
 
 
 DEVICE_TABLE = {
+    "pm list packages -3 -d": "",          # 無効化されたアプリ（先に書かないと下の行に一致してしまう）
     "pm list packages -3": USER_PKGS,
     "dumpsys usagestats": USAGE,
     "dumpsys package com.old.game": "    firstInstallTime=2025-01-01 10:00:00",

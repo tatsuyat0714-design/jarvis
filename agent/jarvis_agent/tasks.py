@@ -6,7 +6,7 @@
 保存された承認待ちの提案ファイルが書き換えられても、任意のコマンドは実行されない。
 
   optimize : キャッシュ・メモリ・裏で常習的に重いアプリの監視と、終了・制限      （軽い）
-  unused   : 使用履歴（usagestats）から未使用アプリを抽出                  （重い）
+  unused   : 使用履歴から未使用アプリを抽出し、無効化 → アンインストールの段階で整理（重い）
   updates  : インストール済みバージョンの差分、ローカル APK の検証付き更新  （重い）
   dupes    : 重複ファイル検出と、LLM / 既定ルールによる「残す 1 つ」の判断   （重い）
 """
@@ -105,16 +105,25 @@ def _parse_time(s: str) -> float | None:
     return t if t > 946684800 else None  # 2000 年より前 = 未記録
 
 
-_USAGE = re.compile(r'package=(\S+) totalTimeUsed="[^"]*" lastTimeUsed="([^"]*)"')
+# 使ったと見なす時刻: 前面に出した（Used）・画面に見えた（Visible）・他アプリやウィジェットから
+# コンポーネントが使われた（ComponentUsed）。キーボードやウィジェットのように「開かない」アプリもある
+_USAGE_LINE = re.compile(r"package=(\S+)(.*)")
+_USAGE_KEYS = re.compile(r'(lastTimeUsed|lastTimeVisible|lastTimeComponentUsed)="([^"]*)"')
+USAGE_CMD = "dumpsys usagestats | grep -E 'package=[^ ]+ totalTime'"
 
 
 def parse_usage(text: str) -> dict[str, float]:
     """dumpsys usagestats の各期間（日・週・月・年）から、パッケージごとの最終使用時刻の最大値。"""
     last: dict[str, float] = {}
-    for pkg, ts in _USAGE.findall(text):
-        t = _parse_time(ts)
-        if t and t > last.get(pkg, 0):
-            last[pkg] = t
+    for line in text.splitlines():
+        m = _USAGE_LINE.search(line)
+        if not m:
+            continue
+        pkg = m.group(1)
+        for _, ts in _USAGE_KEYS.findall(m.group(2)):
+            t = _parse_time(ts)
+            if t and t > last.get(pkg, 0):
+                last[pkg] = t
     return last
 
 
@@ -151,6 +160,33 @@ def parse_badging(text: str) -> tuple[str, int, str] | None:
 # ---------------------------------------------------------------- tasks
 
 _LIST = re.compile(r"\[(.*)\]")
+
+
+def parse_diskstats_arrays(text: str) -> dict[str, list]:
+    """dumpsys diskstats の `Package Names: [...]` / `App Sizes: [...]` などの配列行。"""
+    out: dict[str, list] = {}
+    for line in text.splitlines():
+        key, _, val = line.partition(":")
+        if val.strip().startswith("["):
+            try:
+                arr = json.loads(val.strip())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(arr, list):
+                out[key.strip()] = arr
+    return out
+
+
+def parse_app_sizes(text: str) -> dict[str, int]:
+    """アプリ本体 + データのバイト数（diskstats の集計値。キャッシュは含めない）。"""
+    arr = parse_diskstats_arrays(text)
+    names = arr.get("Package Names", [])
+    app = arr.get("App Sizes", [])
+    data = arr.get("App Data Sizes", [0] * len(names))
+    if not (len(names) == len(app) == len(data)):
+        return {}
+    return {str(n): int(a) + int(d) for n, a, d in zip(names, app, data)
+            if isinstance(a, (int, float)) and isinstance(d, (int, float))}
 
 
 def parse_diskstats(text: str) -> tuple[int | None, dict[str, int]]:
@@ -277,7 +313,7 @@ def optimize(ctx: TaskContext) -> Report:
                    if p in users and p not in exclude and p not in restricted and valid_package(p))
     if cands and sdk and sdk >= 31:
         raw2 = run_sections(ctx.transport, {
-            "usage": "dumpsys usagestats | grep -oE 'package=[^ ]+ totalTimeUsed=\"[^\"]*\" lastTimeUsed=\"[^\"]*\"'",
+            "usage": USAGE_CMD,
             "bucket": "for p in " + " ".join(cands) + "; do echo \"$p=$(am get-standby-bucket $p)\"; done",
         }, timeout=40)
         usage = parse_usage(raw2.get("usage", ""))
@@ -319,42 +355,115 @@ def optimize(ctx: TaskContext) -> Report:
     return rep
 
 
+# 端末の仕組みに組み込まれていて、開かなくても使われているアプリ（消すと電話・SMS・入力・
+# ホーム・パスワード管理・VPN・ユーザー補助・端末管理・置いてあるウィジェットが壊れる）
+_ROLES = "HOME SMS DIALER BROWSER ASSISTANT CALL_SCREENING CALL_REDIRECTION EMERGENCY"
+INTEGRATED_SECTIONS = {
+    "roles": f"for r in {_ROLES}; do cmd role get-role-holders --user 0 android.app.role.$r; done",
+    "settings": "for k in default_input_method enabled_input_methods enabled_accessibility_services "
+                "enabled_notification_listeners autofill_service always_on_vpn_app; do "
+                "settings get secure $k; done",
+    "admins": "dumpsys device_policy | grep -oE '[a-zA-Z][a-zA-Z0-9_.]+/[a-zA-Z0-9_.$]+'",
+    "widgets": "dumpsys appwidget | sed -n '/^Widgets:/,/^Hosts:/p' | grep -oE 'ComponentInfo\\{[^/}]+'",
+    "wallpaper": "dumpsys wallpaper | grep -m1 -oE 'mWallpaperComponent=[^ ]+'",
+}
+_PKG_TOKEN = re.compile(r"(?<![\w.])([a-zA-Z]\w*(?:\.\w+)+)(?=/|\s|$|:|,)")
+
+
+def parse_integrated(raw: dict[str, str]) -> set[str]:
+    """役割の保持アプリ・有効なキーボード / ユーザー補助 / 通知リスナー / 自動入力 / VPN /
+    端末管理アプリ・配置済みウィジェット・ライブ壁紙のパッケージ名を集める（多めに拾う方が安全）。"""
+    out: set[str] = set()
+    for key in INTEGRATED_SECTIONS:
+        text = raw.get(key, "").replace("ComponentInfo{", " ").replace("mWallpaperComponent=", " ")
+        for tok in _PKG_TOKEN.findall(text):
+            if valid_package(tok):
+                out.add(tok)
+    return out
+
+
+def _integrated_packages(ctx: TaskContext) -> set[str]:
+    return parse_integrated(run_sections(ctx.transport, INTEGRATED_SECTIONS, timeout=30))
+
+
 def unused(ctx: TaskContext) -> Report:
+    cfg = ctx.cfg
     raw = run_sections(ctx.transport, {
         "user": "pm list packages -3",
-        "usage": "dumpsys usagestats | grep -oE 'package=[^ ]+ totalTimeUsed=\"[^\"]*\" lastTimeUsed=\"[^\"]*\"'",
-    }, timeout=40)
+        "disabled": "pm list packages -3 -d",
+        "usage": USAGE_CMD,
+        "disk": "dumpsys diskstats | grep -E '^(Package Names|App Sizes|App Data Sizes):'",
+        **INTEGRATED_SECTIONS,
+    }, timeout=60)
     users = parse_pkg_list(raw.get("user", ""))
     usage = parse_usage(raw.get("usage", ""))
     if not users or not usage:
         # 使用履歴が読めないまま判定すると「全アプリ未使用」になるので、提案は出さない
         raise TaskError("アプリ一覧または使用履歴を取得できませんでした")
+    disabled_now = parse_pkg_list(raw.get("disabled", ""))
+    sizes = parse_app_sizes(raw.get("disk", ""))
+    integrated = parse_integrated(raw)
 
-    days = ctx.cfg["unused_days"]
+    days = cfg["unused_days"]
     cutoff = ctx.now - days * 86400
-    ignore = set(ctx.cfg["unused_ignore"])
-    cands = sorted(p for p in users - ignore if usage.get(p, 0) < cutoff)[:40]
+    ignore = set(cfg["unused_ignore"])
+    ours: dict[str, dict] = ctx.store.state.get("disabled", {})
+    # 利用者が自分で有効に戻したアプリは記録から外す（次からは通常の判定に戻る）
+    for p in [p for p in ours if p not in disabled_now]:
+        del ours[p]
+    ctx.store.save()
 
-    # インストール直後で未使用なだけのアプリを除くため、候補だけインストール日時を見る
+    rep = Report("unused", "")
+    kept = [p for p in users - ignore if p in integrated and usage.get(p, 0) < cutoff]
+    if kept:
+        rep.details.append("端末の機能に組み込まれているため対象外: " + ", ".join(sorted(kept)))
+
+    # 1) 無効化して一定期間たっても有効に戻されていない → アンインストールを提案
+    after = cfg["unused_uninstall_after_days"]
+    for p, rec in sorted(ours.items()):
+        if p in disabled_now and p not in integrated and ctx.now - rec.get("t", ctx.now) >= after * 86400:
+            rep.proposals.append(Proposal(
+                "uninstall", {"package": p}, f"{p} をアンインストール", "high",
+                f"無効化して {int((ctx.now - rec['t']) // 86400)} 日、有効に戻されていない" + _fmt_size(sizes.get(p))))
+
+    # 2) 未使用 → 無効化（データは残り、disabled undo で戻せる）か、設定によりアンインストール
+    cands = [p for p in users - ignore - integrated - disabled_now
+             if usage.get(p, 0) < cutoff and valid_package(p)]
+    cands = sorted(cands, key=lambda p: -sizes.get(p, 0))[:40]
     installed: dict[str, float] = {}
     if cands:
+        # インストール直後で未使用なだけのアプリを除くため、候補だけインストール日時を見る
         raw2 = run_sections(ctx.transport, {p: f"dumpsys package {p} | grep -m1 firstInstallTime"
                                             for p in cands}, timeout=40)
         for p, text in raw2.items():
             m = re.search(r"firstInstallTime=(.+)", text)
             if m and (t := _parse_time(m.group(1))):
                 installed[p] = t
-
-    rep = Report("unused", "")
+    action = "uninstall" if cfg["unused_action"] == "uninstall" else "disable_app"
+    total = 0
     for p in cands:
         if installed.get(p, 0) > cutoff:
             continue
         last = usage.get(p)
-        why = f"{int((ctx.now - last) // 86400)}日間未使用" if last else "使用記録なし"
-        rep.proposals.append(Proposal("uninstall", {"package": p}, f"{p} をアンインストール", "high", why))
+        why = (f"{int((ctx.now - last) // 86400)}日間未使用" if last else "使用記録なし") + _fmt_size(sizes.get(p))
+        total += sizes.get(p, 0)
+        if action == "uninstall":
+            rep.proposals.append(Proposal("uninstall", {"package": p}, f"{p} をアンインストール", "high", why))
+        else:
+            rep.proposals.append(Proposal("disable_app", {"package": p}, f"{p} を無効化", "high",
+                                          why + "。データは残り、disabled undo で戻せる"))
         rep.details.append(f"{p}: {why}")
-    rep.summary = f"ユーザーアプリ {len(users)} 件中、{days}日以上未使用 {len(rep.proposals)} 件"
+    size_s = f"（合計 {total / 1024**3:.1f}GB）" if total else ""
+    rep.summary = (f"ユーザーアプリ {len(users)} 件中、{days}日以上未使用 "
+                   f"{sum(1 for x in rep.proposals if x.args['package'] in cands)} 件{size_s}"
+                   + (f"、無効化中 {len(ours)} 件" if ours else ""))
     return rep
+
+
+def _fmt_size(n: int | None) -> str:
+    if not n:
+        return ""
+    return f"・{n / 1024**3:.1f}GB" if n >= 1024**3 else f"・{n / 1024**2:.0f}MB"
 
 
 def _read_local_apk(path: str) -> apk.ApkInfo | None:
@@ -546,9 +655,12 @@ def apply(p: Proposal, ctx: TaskContext) -> str:
         return f"{pkg} のバックグラウンドプロセスを終了しました"
     if k == "restrict_bg":
         return _apply_restrict(a, ctx)
+    if k == "disable_app":
+        return _apply_disable(a, ctx)
     if k == "uninstall":
         pkg = _need_pkg(a)
         _need_user_app(ctx, pkg)
+        _need_not_integrated(ctx, pkg)
         res = t.shell(f"pm uninstall --user 0 {pkg}", timeout=60)
         if "Success" not in res.stdout:
             raise ApplyError(f"アンインストール失敗: {res.stdout.strip() or res.stderr.strip()}")
@@ -558,6 +670,50 @@ def apply(p: Proposal, ctx: TaskContext) -> str:
     if k == "trash":
         return _apply_trash(a, ctx)
     raise ApplyError(f"未知の提案: {k}")
+
+
+def _need_not_integrated(ctx: TaskContext, pkg: str) -> None:
+    # 提案後に既定の SMS アプリやキーボードにされていることもあるので、実行直前に確かめ直す
+    if pkg in _integrated_packages(ctx):
+        raise ApplyError(f"{pkg} は端末の機能（既定アプリ・キーボード・ユーザー補助など）に使われています")
+
+
+def _disabled_packages(ctx: TaskContext) -> set[str]:
+    return parse_pkg_list(ctx.transport.shell("pm list packages -3 -d").stdout)
+
+
+def _apply_disable(a: dict, ctx: TaskContext) -> str:
+    pkg = _need_pkg(a)
+    if pkg in ctx.cfg["unused_ignore"]:
+        raise ApplyError(f"{pkg} は除外設定に入っています")
+    _need_user_app(ctx, pkg)
+    _need_not_integrated(ctx, pkg)
+    if pkg in _disabled_packages(ctx):
+        raise ApplyError(f"{pkg} は既に無効です")
+    ctx.transport.shell(f"pm disable-user --user 0 {pkg}")
+    if pkg not in _disabled_packages(ctx):
+        raise ApplyError("無効化できませんでした")
+    ctx.store.state.setdefault("disabled", {})[pkg] = {"t": ctx.now}
+    ctx.store.save()
+    return f"{pkg} を無効化しました（データは残っています。元に戻す: disabled undo {pkg}）"
+
+
+def enable_app(pkg: str, ctx: TaskContext) -> str:
+    """disable_app の取り消し。"""
+    if pkg not in ctx.store.state.get("disabled", {}):
+        raise ApplyError(f"{pkg} はこのエージェントが無効化したアプリではありません")
+    if not valid_package(pkg):
+        raise ApplyError(f"不正なパッケージ名: {pkg!r}")
+    if pkg in _disabled_packages(ctx):
+        ctx.transport.shell(f"pm enable --user 0 {pkg}")
+        if pkg in _disabled_packages(ctx):
+            raise ApplyError(f"{pkg} を有効に戻せませんでした")
+        msg = f"{pkg} を有効に戻しました"
+    else:
+        msg = f"{pkg} は既に有効でした（記録を消しました）"
+    del ctx.store.state["disabled"][pkg]
+    ctx.store.save()
+    return msg
 
 
 def _get_bucket(ctx: TaskContext, pkg: str) -> int | None:

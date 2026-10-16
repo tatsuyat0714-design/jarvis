@@ -8,8 +8,11 @@
   python -m jarvis_agent run "目標"              ステートマシンで目標達成まで操作（危険な操作は確認）
   python -m jarvis_agent task optimize|unused|updates|dupes [--llm] [--save]
                                                  タスクを実行し、提案を 1 件ずつ確認して実行
-  python -m jarvis_agent pending [--apply] [--task NAME]
-                                                 承認待ちの提案を表示（--apply で確認しながら実行）
+  python -m jarvis_agent pending [--apply] [--task NAME] [--dismiss ID|all]
+                                                 承認待ちの提案を表示（--apply で確認しながら実行、
+                                                 --dismiss で見送り: 90 日は同じ提案を出さない）
+  python -m jarvis_agent disabled [list|undo PKG|undo all]
+                                                 unused で無効化したアプリの一覧・有効に戻す
   python -m jarvis_agent trash list|restore ID|purge [--days N]
                                                  重複整理のゴミ箱の一覧・復元・完全削除
   python -m jarvis_agent restricted [list|undo PKG|undo all]
@@ -38,7 +41,7 @@ from .context import build_messages, render
 from .device import DeviceProbe, build_script
 from .llm import DEFAULT_URL, EchoLLM, LLMError, LocalLLM
 from .store import Store
-from .tasks import TASKS, ApplyError, Proposal, TaskContext, TaskError, apply, run_task, unrestrict
+from .tasks import TASKS, ApplyError, Proposal, TaskContext, TaskError, apply, run_task, unrestrict, enable_app
 from .transport import FakeTransport, TransportError, WrapperTransport
 
 
@@ -184,6 +187,13 @@ def main(argv: list[str] | None = None) -> int:
     pd = sub.add_parser("pending")
     pd.add_argument("--apply", action="store_true")
     pd.add_argument("--task", choices=sorted(TASKS), help="このタスクの提案だけ")
+    pd.add_argument("--dismiss", metavar="ID|all", help="提案を見送る（dismiss_days の間は再提案しない）")
+
+    ds = sub.add_parser("disabled")
+    dss = ds.add_subparsers(dest="disabled_cmd")
+    dss.add_parser("list")
+    du = dss.add_parser("undo")
+    du.add_argument("package", help="パッケージ名、または all")
 
     tr = sub.add_parser("trash")
     trs = tr.add_subparsers(dest="trash_cmd", required=True)
@@ -210,6 +220,25 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "trash":
             return trash_cmd(args, Store())
+
+        if args.cmd == "disabled":
+            store = Store()
+            recs = store.state.get("disabled", {})
+            if args.disabled_cmd != "undo":
+                if not recs:
+                    print("このエージェントが無効化したアプリはありません")
+                for pkg, r in sorted(recs.items()):
+                    print(f"{pkg}  {time.strftime('%Y-%m-%d', time.localtime(r.get('t', 0)))} から無効")
+                return 0
+            ctx = TaskContext(transport, store)
+            rc = 0
+            for pkg in (sorted(recs) if args.package == "all" else [args.package]):
+                try:
+                    print(enable_app(pkg, ctx))
+                except ApplyError as e:
+                    print(f"失敗: {e}", file=sys.stderr)
+                    rc = 1
+            return rc
 
         if args.cmd == "restricted":
             store = Store()
@@ -253,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
                 items = [Proposal.from_dict(d) for d in store.pending()]
                 if args.task:
                     items = [p for p in items if p.task == args.task]
+                if args.dismiss:
+                    targets = items if args.dismiss == "all" else [p for p in items if p.id == args.dismiss]
+                    if not targets:
+                        print(f"提案が見つかりません: {args.dismiss}", file=sys.stderr)
+                        return 1
+                    for p in targets:
+                        store.dismiss(p.id)
+                        print(f"見送りました: {p.title}")
+                    return 0
                 if not items:
                     print("承認待ちの提案はありません")
                 for p in items:

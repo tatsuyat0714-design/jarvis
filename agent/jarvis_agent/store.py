@@ -27,6 +27,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 走査しないフォルダ
     "dupe_exclude": [],
     "unused_days": 30,
+    # 未使用アプリへの提案: "disable"（無効化。データは残り戻せる）か "uninstall"
+    "unused_action": "disable",
+    # 無効化してこの日数たっても有効に戻されていなければ、アンインストールを提案する
+    "unused_uninstall_after_days": 30,
+    # pending dismiss で見送った提案を、この日数は再提案しない
+    "dismiss_days": 90,
     # 未使用判定から外すアプリ（エージェント自身と、その動作に必要なもの）
     "unused_ignore": ["com.termux", "com.termux.api", "com.termux.boot", "moe.shizuku.privileged.api",
                       "com.tatsuya.jarvis"],
@@ -91,13 +97,26 @@ class Store:
     def pending(self) -> list[dict]:
         return self.state.get("pending", [])
 
-    def add_pending(self, items: list[dict]) -> int:
+    def add_pending(self, items: list[dict], now: float | None = None) -> int:
         cur = self.state.setdefault("pending", [])
-        ids = {p["id"] for p in cur}
+        ids = {p["id"] for p in cur} | self.dismissed_ids(now)
         new = [p for p in items if p["id"] not in ids]
         cur.extend(new)
         self.save()
         return len(new)
+
+    def dismiss(self, pid: str, now: float | None = None) -> None:
+        """提案を見送る。dismiss_days の間は同じ提案（同じ id）を承認待ちに戻さない。"""
+        self.state.setdefault("dismissed", {})[pid] = now or time.time()
+        self.remove_pending(pid)
+
+    def dismissed_ids(self, now: float | None = None) -> set[str]:
+        now = now or time.time()
+        limit = self.config["dismiss_days"] * 86400
+        d = self.state.get("dismissed", {})
+        for pid in [k for k, t in d.items() if now - t >= limit]:
+            del d[pid]
+        return set(d)
 
     def remove_pending(self, pid: str) -> None:
         self.state["pending"] = [p for p in self.pending() if p["id"] != pid]
