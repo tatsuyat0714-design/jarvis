@@ -22,6 +22,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                    "/sdcard/Documents", "/sdcard/Movies", "/sdcard/Music"],
     "dupe_min_bytes": 1024 * 1024,
     "trash_dir": "/sdcard/.jarvis_trash",
+    # 保護フォルダ: ここにあるファイルは重複でもゴミ箱へ移さない（残す側にだけなる）
+    "dupe_protect": [],
+    # 走査しないフォルダ
+    "dupe_exclude": [],
     "unused_days": 30,
     # 未使用判定から外すアプリ（エージェント自身と、その動作に必要なもの）
     "unused_ignore": ["com.termux", "com.termux.api", "com.termux.boot", "moe.shizuku.privileged.api",

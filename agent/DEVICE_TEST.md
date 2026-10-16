@@ -370,11 +370,43 @@ python -m jarvis_agent task dupes --llm     # 今回は N と答える
 
 - [ ] 提案の理由に `llm:` と LLM の理由が出る（`heuristic:` になっていたら LLM の応答が使えなかった）
 
+ゴミ箱の確認と復元:
+
+```sh
+python -m jarvis_agent trash list
+python -m jarvis_agent trash restore latest
+```
+
+- [ ] `trash list` に、移したファイルの件数と容量のバッチが出る
+- [ ] `/sdcard/jarvis_test_trash/.nomedia` があり、ギャラリーアプリにゴミ箱内の画像が出ない
+- [ ] `restore latest` で `Download/IMG_0001 (1).jpg` が元の場所に戻り、`trash list` が空になる
+
+アプリが保存したコピーと保護フォルダ:
+
+```sh
+mkdir -p "/sdcard/jarvis_test/Android/media/com.whatsapp/WhatsApp/Media"
+cp /sdcard/jarvis_test/DCIM/IMG_0001.jpg "/sdcard/jarvis_test/Android/media/com.whatsapp/WhatsApp/Media/IMG-WA0001.jpg"
+python -m jarvis_agent task dupes --save
+python -m jarvis_agent pending --task dupes
+```
+
+- [ ] 残す側が `DCIM/IMG_0001.jpg`、移す側に WhatsApp と Download のコピーが入っている
+
+`~/.jarvis/config.json` に `"dupe_protect": ["/sdcard/jarvis_test/Download"]` を足して（他の項目はそのまま）もう一度:
+
+```sh
+python -m jarvis_agent task dupes --save
+python -m jarvis_agent pending --task dupes
+```
+
+- [ ] 新しい提案の移す側に `Download` のファイルが **含まれない**
+
 後片付け:
 
 ```sh
 rm -rf /sdcard/jarvis_test /sdcard/jarvis_test_trash
 rm ~/.jarvis/config.json     # 既定の対象フォルダに戻す
+python -c "import json,pathlib; p=pathlib.Path.home()/'.jarvis/state.json'; d=json.loads(p.read_text()); d['pending']=[x for x in d.get('pending',[]) if x.get('task')!='dupes']; p.write_text(json.dumps(d))"
 ```
 
 ---

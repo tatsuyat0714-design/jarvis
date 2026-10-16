@@ -26,6 +26,7 @@ from typing import Callable
 
 from . import apk
 from . import dupes as dp
+from . import trash
 from .device import SECTIONS, parse_focus, parse_storage, run_sections
 from .llm import LLM
 from .store import Store
@@ -302,24 +303,34 @@ def updates(ctx: TaskContext) -> Report:
 
 
 def dupes(ctx: TaskContext) -> Report:
-    files = dp.walk(ctx.cfg["dupe_roots"], ctx.cfg["dupe_min_bytes"], exclude=[ctx.cfg["trash_dir"]])
+    protect = ctx.cfg["dupe_protect"]
+    files = list(dp.walk(ctx.cfg["dupe_roots"], ctx.cfg["dupe_min_bytes"],
+                         exclude=[ctx.cfg["trash_dir"], *ctx.cfg["dupe_exclude"]]))
     groups = dp.find_duplicates(files, ctx.store.hashes)
+    dp.prune_cache(ctx.store.hashes, (f.path for f in files))
     ctx.store.save_hashes()
-    decisions = dp.judge_with_llm(ctx.llm, groups) if ctx.llm else dp.judge_heuristic(groups)
+    decisions = (dp.judge_with_llm(ctx.llm, groups, protect=protect) if ctx.llm
+                 else dp.judge_heuristic(groups, protect))
 
     rep = Report("dupes", "")
+    wasted = 0
     for g, d in zip(groups, decisions):
         if d.keep is None:
             rep.details.append(f"保留: {g.files[0].path} ほか {len(g.files) - 1} 件（{d.reason}）")
             continue
         keep = g.files[d.keep]
-        others = [f.path for i, f in enumerate(g.files) if i != d.keep]
+        others = [f.path for f in dp.to_trash(g, d.keep, protect)]
+        if not others:
+            rep.details.append(f"すべて保護フォルダ内のため対象外: {keep.path} ほか {len(g.files) - 1} 件")
+            continue
+        size = g.size * len(others)
+        wasted += size
         rep.proposals.append(Proposal(
             "trash", {"keep": keep.path, "files": others, "sha256": g.sha256},
-            f"{os.path.basename(keep.path)} の重複 {len(others)} 件をゴミ箱へ（{dp._fmt_size(g.wasted)}）",
+            f"{os.path.basename(keep.path)} の重複 {len(others)} 件をゴミ箱へ（{dp._fmt_size(size)}）",
             "high", f"残す: {keep.path}（{d.by}: {d.reason}）"))
-    wasted = sum(g.wasted for g, d in zip(groups, decisions) if d.keep is not None)
-    rep.summary = f"重複 {len(groups)} グループ、整理すると {dp._fmt_size(wasted)} 空く"
+    rep.summary = (f"{len(files)} ファイル中、重複 {len(groups)} グループ、"
+                   f"整理すると {dp._fmt_size(wasted)} 空く")
     return rep
 
 
@@ -478,16 +489,26 @@ def _apply_trash(a: dict, ctx: TaskContext) -> str:
             raise ApplyError(f"残す側のファイルが変わっています: {keep}")
     except OSError as e:
         raise ApplyError(f"残す側のファイルが読めません: {keep}") from e
-    dest_root = os.path.join(ctx.cfg["trash_dir"], time.strftime("%Y%m%d-%H%M%S", time.localtime(ctx.now)))
-    moved = 0
+    moved, skipped = 0, []
     for f in files:
+        if dp.is_protected(f, ctx.cfg["dupe_protect"]):
+            skipped.append(f"{os.path.basename(f)}（保護フォルダ）")
+            continue
         try:
             if dp.sha256_file(f) != sha:
+                skipped.append(f"{os.path.basename(f)}（中身が変わっている）")
                 continue
         except OSError:
+            skipped.append(f"{os.path.basename(f)}（見つからない）")
             continue
-        dest = os.path.join(dest_root, os.path.realpath(f).lstrip("/"))
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.move(f, dest)
+        try:
+            trash.move_to_trash(ctx.cfg["trash_dir"], ctx.now, f, sha, keep)
+        except trash.TrashError as e:
+            skipped.append(f"{os.path.basename(f)}（{e}）")
+            continue
         moved += 1
-    return f"{moved} 件をゴミ箱（{dest_root}）へ移動しました。残したファイル: {keep}"
+    batch = os.path.basename(trash.batch_dir(ctx.cfg["trash_dir"], ctx.now))
+    msg = f"{moved} 件をゴミ箱（{batch}）へ移動しました。残したファイル: {keep}"
+    if skipped:
+        msg += "。移さなかったもの: " + "、".join(skipped)
+    return msg

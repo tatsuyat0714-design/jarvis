@@ -23,6 +23,8 @@ agent/
 │   ├── daemon.py            イベント → ルール → タスクの常駐ディスパッチャ
 │   ├── tasks.py             定型タスクと、提案の検証・実行（apply）
 │   ├── dupes.py             重複ファイル検出と「残す 1 つ」の判断（既定ルール / LLM）
+│   ├── trash.py             重複整理のゴミ箱（記録・復元・完全削除）
+│   ├── apk.py               APK のメタ情報の読み取り（aapt 不要）
 │   ├── store.py             永続状態（~/.jarvis/）
 │   └── __main__.py          メインコントローラー（CLI）
 └── tests/                   python -m unittest discover -s tests
@@ -192,6 +194,10 @@ Termux:Boot に `daemon` を登録すると再起動後も常駐する。
 ```sh
 python -m jarvis_agent task optimize        # 実行して、提案を 1 件ずつ確認しながら実行
 python -m jarvis_agent task dupes --llm     # 重複の「残す 1 つ」をローカル LLM に判断させる
+python -m jarvis_agent pending --apply --task dupes   # 重複の提案だけ確認（a で残りをまとめて実行）
+python -m jarvis_agent trash list           # ゴミ箱の一覧
+python -m jarvis_agent trash restore latest # 直近のバッチを元の場所へ戻す
+python -m jarvis_agent trash purge --days 30  # 30 日より古いバッチを完全に削除（確認あり）
 python -m jarvis_agent task unused --save   # 確認せず承認待ちに保存
 python -m jarvis_agent pending --apply      # 承認待ちを確認しながら実行
 ```
@@ -202,6 +208,36 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
 | unused | `dumpsys usagestats` の全期間から最終使用日時、候補だけ `firstInstallTime` | 30 日以上未使用のアプリをアンインストール（高）。インストール直後のアプリと Termux / Shizuku は除外 |
 | updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。詳細は下記 |
 | dupes | サイズ → 先頭 64KiB の SHA-256 → 全体の SHA-256。ハッシュはキャッシュ | 残す 1 つ以外をゴミ箱へ移動（高） |
+
+### 重複ファイル整理（dupes）
+
+**どれを残すか**（既定ルール。`--llm` のときも、LLM の応答が使えなければこのルールに戻る）
+
+1. 保護フォルダ（`dupe_protect`）にあるもの
+2. 保存場所: カメラの元ファイル（DCIM）→ Pictures・Movies・Music・Documents など → その他 → Download →
+   LINE・WhatsApp・Telegram などアプリが保存したコピー（親が Pictures でもアプリのフォルダならこちら）
+3. 名前にコピー印（`(1)`・`のコピー`・`copy` など）が無いもの
+4. 古いもの
+
+保護フォルダのファイルは、残す側に選ばれなくても **ゴミ箱へは移さない**。グループ全体が保護フォルダ内なら提案しない。
+LLM には保護されたファイルに `[保護]` を付けて見せる。
+
+**ゴミ箱**（`trash_dir`、既定 `/sdcard/.jarvis_trash`）
+
+- 1 回の確認セッションで移したファイルを 1 つの「バッチ」（日時フォルダ）にまとめ、`manifest.json` に
+  元の場所・移動先・SHA-256・残したファイルを記録する。`.nomedia` を置くのでギャラリーには出ない
+- `trash restore <バッチ>` で元の場所へ戻す。戻す前に、戻し先が `dupe_roots` の中か、移動元がそのバッチの中か、
+  中身が記録の SHA-256 と同じか、元の場所に別のファイルが無いかを確かめ、満たさないものは戻さずに理由を表示する
+  （manifest は共有ストレージにあり他のアプリから書き換えられうるため、記録をそのまま信用しない）
+- `trash purge` だけが完全に削除する。端末での確認（y）が必須で、daemon からは実行されない
+- v0.3 以前に移したバッチは記録が無いので一覧には出るが復元はできない（purge は可能）
+
+**その他**
+
+- 走査時に見つからなかったファイルのハッシュはキャッシュから消す（キャッシュが増え続けない）
+- `dupe_exclude` に書いたフォルダは走査しない（フォルダ単位で比べるので `DCIM` を除外しても `DCIM2` は対象）
+- `pending --apply` でゴミ箱への移動（とプロセス終了）の提案が続くときは `a` で残りをまとめて実行できる。
+  アンインストールや APK のインストールなど取り消せないものは、必ず 1 件ずつ確認する
 
 ### 自動更新（updates）の流れ
 
@@ -226,8 +262,8 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
   （パッケージ名の形式、実行直前の「ユーザーアプリか」の再確認、APK は `apk_dir` の中だけ）
 - **無人では高リスクの提案を実行しない**。低リスクも `auto_apply_low_risk: true` のときだけ自動実行
 - 使用履歴が取れなかったときは unused を中止する（「全アプリ未使用」と誤判定しないため）
-- 重複の削除は **完全削除ではなくゴミ箱（`/sdcard/.jarvis_trash/日時/元のパス`）へ移動**。移動の直前に、残す側と移動する側を
-  読み直してハッシュが一致することを確かめる。残す側が変わっていたら何もしない
+- 重複の削除は **完全削除ではなくゴミ箱へ移動**し、記録から元に戻せる。移動の直前に、残す側と移動する側を
+  読み直してハッシュが一致することを確かめる。残す側が変わっていたら何もしない。完全削除は `trash purge`（確認必須）だけ
 - LLM の判断は **「残すファイルの番号」だけ**を返させる。パスを書かせないので、グループ外のファイルを指定できない。
   不正な応答は既定ルールに戻し、`keep: null`（迷う）なら何も消さない
 
@@ -237,6 +273,9 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
 {
   "dupe_roots": ["/sdcard/DCIM", "/sdcard/Pictures", "/sdcard/Download"],
   "dupe_min_bytes": 1048576,
+  "dupe_protect": ["/sdcard/DCIM/Camera"],
+  "dupe_exclude": ["/sdcard/Download/keep"],
+  "trash_dir": "/sdcard/.jarvis_trash",
   "unused_days": 30,
   "unused_ignore": ["com.termux", "moe.shizuku.privileged.api"],
   "apk_dir": "/sdcard/Download",

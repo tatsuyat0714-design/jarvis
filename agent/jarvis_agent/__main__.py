@@ -8,7 +8,10 @@
   python -m jarvis_agent run "目標"              ステートマシンで目標達成まで操作（危険な操作は確認）
   python -m jarvis_agent task optimize|unused|updates|dupes [--llm] [--save]
                                                  タスクを実行し、提案を 1 件ずつ確認して実行
-  python -m jarvis_agent pending [--apply]       承認待ちの提案を表示（--apply で確認しながら実行）
+  python -m jarvis_agent pending [--apply] [--task NAME]
+                                                 承認待ちの提案を表示（--apply で確認しながら実行）
+  python -m jarvis_agent trash list|restore ID|purge [--days N]
+                                                 重複整理のゴミ箱の一覧・復元・完全削除
   python -m jarvis_agent events [--poll]         イベントを表示するだけ（トリガーの動作確認）
   python -m jarvis_agent daemon [--poll]         イベント駆動で常駐し、ルールに従ってタスクを実行
 
@@ -24,7 +27,9 @@ import time
 from pathlib import Path
 
 from . import events as ev
+from . import trash
 from . import ui
+from .dupes import sha256_file
 from .agent import Action, Agent, LLMPlanner, StepLog
 from .daemon import Dispatcher, run_forever
 from .context import build_messages, render
@@ -50,25 +55,87 @@ def ask_confirm(a: Action) -> bool:
     return ans.strip().lower() in ("y", "yes")
 
 
-def confirm_proposal(p: Proposal) -> bool:
+# まとめて承認（a）できる種類。ゴミ箱への移動（戻せる）とプロセス終了だけで、
+# アンインストール・APK のインストールなど取り消せないものは必ず 1 件ずつ確認する
+BULK_OK = {"trash", "kill_bg"}
+
+
+def confirm_proposal(p: Proposal, rest_same_kind: int = 0) -> str:
+    """'y' / 'n' / 'a'（これと残りの同じ種類をすべて実行）を返す。"""
     if not sys.stdin.isatty():
-        return False
+        return "n"
     mark = "⚠" if p.risk == "high" else "・"
-    ans = input(f"{mark} {p.title}（{p.reason}）を実行しますか？ [y/N] ")
-    return ans.strip().lower() in ("y", "yes")
+    choices = "[y/N/a=残り {} 件も同じ種類はすべて実行]".format(rest_same_kind) if rest_same_kind else "[y/N]"
+    ans = input(f"{mark} {p.title}（{p.reason}）を実行しますか？ {choices} ").strip().lower()
+    if ans == "a" and rest_same_kind:
+        return "a"
+    return "y" if ans in ("y", "yes") else "n"
 
 
 def review(proposals: list[Proposal], ctx: TaskContext, store: Store | None = None) -> None:
     """提案を 1 件ずつ確認して実行する。承認しなかったものはそのまま残す。"""
-    for p in proposals:
-        if not confirm_proposal(p):
-            continue
+    approve_all: set[str] = set()
+    for i, p in enumerate(proposals):
+        if p.kind not in approve_all:
+            rest = sum(1 for q in proposals[i + 1:] if q.kind == p.kind) if p.kind in BULK_OK else 0
+            ans = confirm_proposal(p, rest)
+            if ans == "a":
+                approve_all.add(p.kind)
+            elif ans != "y":
+                continue
+        else:
+            print(f"・ {p.title}")
         try:
             print("  → " + apply(p, ctx))
             if store:
                 store.remove_pending(p.id)
         except (ApplyError, TransportError, OSError) as e:
             print(f"  → 失敗: {e}", file=sys.stderr)
+
+
+def _fmt_mb(n: int) -> str:
+    return f"{n / 1024**2:.1f}MB"
+
+
+def trash_cmd(args, store: Store) -> int:
+    tdir = store.config["trash_dir"]
+    batches = trash.list_batches(tdir)
+    if args.trash_cmd == "list":
+        if not batches:
+            print("ゴミ箱は空です")
+        for b in batches:
+            note = "" if b.has_manifest else "（記録なし・復元不可）"
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(b.created))
+            print(f"{b.id}  {when}  {b.file_count} 件  {_fmt_mb(b.size)}{note}")
+        return 0
+
+    if args.trash_cmd == "restore":
+        target = batches[:1] if args.batch == "latest" else [b for b in batches if b.id == args.batch]
+        if not target:
+            print(f"バッチが見つかりません: {args.batch}", file=sys.stderr)
+            return 1
+        b = target[0]
+        n, skipped = trash.restore(b, store.config["dupe_roots"], sha256_file)
+        print(f"{b.id}: {n} 件を元の場所へ戻しました")
+        for s in skipped:
+            print(f"  戻さなかった: {s}")
+        return 0 if not skipped else 1
+
+    old = trash.older_than(batches, args.days, time.time())
+    if not old:
+        print(f"{args.days:g} 日より古いバッチはありません")
+        return 0
+    total = sum(b.size for b in old)
+    print(f"{len(old)} バッチ・{sum(b.file_count for b in old)} 件・{_fmt_mb(total)} を完全に削除します（元に戻せません）")
+    for b in old:
+        print(f"  {b.id}")
+    if not sys.stdin.isatty() or input("よろしいですか？ [y/N] ").strip().lower() not in ("y", "yes"):
+        print("中止しました")
+        return 1
+    for b in old:
+        trash.delete_batch(tdir, b)
+    print("削除しました")
+    return 0
 
 
 def print_log(e: StepLog) -> None:
@@ -114,6 +181,15 @@ def main(argv: list[str] | None = None) -> int:
 
     pd = sub.add_parser("pending")
     pd.add_argument("--apply", action="store_true")
+    pd.add_argument("--task", choices=sorted(TASKS), help="このタスクの提案だけ")
+
+    tr = sub.add_parser("trash")
+    trs = tr.add_subparsers(dest="trash_cmd", required=True)
+    trs.add_parser("list")
+    rs = trs.add_parser("restore")
+    rs.add_argument("batch", help="バッチ ID（trash list の左端）または latest")
+    pg = trs.add_parser("purge")
+    pg.add_argument("--days", type=float, default=30, help="この日数より古いバッチを完全に削除（既定 30）")
 
     for name in ("events", "daemon"):
         d = sub.add_parser(name)
@@ -124,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     probe = DeviceProbe(transport)
 
     try:
+        if args.cmd == "trash":
+            return trash_cmd(args, Store())
+
         if args.cmd in ("task", "pending", "daemon"):
             store = Store()
             llm = LocalLLM(args.llm_url, max_tokens=512) if getattr(args, "llm", False) else None
@@ -143,6 +222,8 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.cmd == "pending":
                 items = [Proposal.from_dict(d) for d in store.pending()]
+                if args.task:
+                    items = [p for p in items if p.task == args.task]
                 if not items:
                     print("承認待ちの提案はありません")
                 for p in items:
@@ -214,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except (TransportError, LLMError, ui.UiError, TaskError) as e:
+    except (TransportError, LLMError, ui.UiError, TaskError, trash.TrashError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
