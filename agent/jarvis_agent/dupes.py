@@ -20,7 +20,7 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from .llm import LLM
 
@@ -90,8 +90,11 @@ def sha256_file(path: str, limit: int | None = None) -> str:
     return h.hexdigest()
 
 
-def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = None) -> list[DupGroup]:
+def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = None,
+                    check: Callable[[], None] | None = None) -> list[DupGroup]:
+    """check はファイルを読む前に毎回呼ぶ（daemon からの中断を受けるため。例外で抜ける）。"""
     cache = cache if cache is not None else {}
+    check = check or (lambda: None)
     by_size: dict[int, list[FileInfo]] = defaultdict(list)
     for f in files:
         by_size[f.size].append(f)
@@ -100,6 +103,7 @@ def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = N
         c = cache.get(f.path)
         if c and c[0] == f.size and c[1] == f.mtime:
             return c[2]
+        check()
         try:
             h = sha256_file(f.path)
         except OSError:
@@ -115,6 +119,7 @@ def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = N
         if size > PARTIAL_BYTES:
             by_head: dict[str, list[FileInfo]] = defaultdict(list)
             for f in same:
+                check()
                 try:
                     by_head[sha256_file(f.path, PARTIAL_BYTES)].append(f)
                 except OSError:
