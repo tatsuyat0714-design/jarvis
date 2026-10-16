@@ -18,7 +18,7 @@
 
    ```sh
    pkg update
-   pkg install python android-tools git termux-api aapt
+   pkg install python android-tools git termux-api
    termux-setup-storage          # 「ファイルへのアクセス」を許可する
    git clone https://github.com/tatsuyat0714-design/jarvis.git
    cd jarvis/agent
@@ -308,6 +308,24 @@ python -m jarvis_agent pending
   ```sh
   bin/adbw.sh shell "dumpsys package packages | grep -m 6 -E 'Package \[|versionCode=|versionName='"
   ```
+
+### 7-2. ローカル APK での更新（任意・ジャービス自身で試す）
+
+ジャービスの APK はどの版も同じ鍵で署名されているので、古い版を入れてから新しい版で更新できる。
+
+1. GitHub の Releases から **1 つ前の版** と **最新版** の APK をダウンロードする
+2. 1 つ前の版をインストールする（既に入っている最新版より古い場合は、先にアンインストールしてから）
+3. 最新版の APK だけを `/sdcard/Download` に置いた状態で:
+
+   ```sh
+   python -m jarvis_agent task updates     # 提案「com.tatsuya.jarvis を 0.1.N-1 → 0.1.N に更新」に y
+   ```
+
+**確認すること**
+- [ ] 提案が 1 件だけ出る（同じアプリの APK が複数あっても、最新の 1 つだけ）
+- [ ] `y` で `… に更新しました` と出て、アプリ情報の版が上がっている
+- [ ] もう一度 `task updates` を実行すると、提案が出ない
+- [ ] 古い方の APK を `/sdcard/Download` に置くと「端末の方が新しい」と出る
 
 ---
 
