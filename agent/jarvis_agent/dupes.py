@@ -54,7 +54,8 @@ def walk(roots: Iterable[str], min_bytes: int = 1, exclude: Iterable[str] = ()) 
     stack = [r for r in roots if os.path.isdir(r)]
     while stack:
         d = stack.pop()
-        if excl and os.path.realpath(d).startswith(excl):
+        rd = os.path.realpath(d)
+        if any(os.path.commonpath([rd, e]) == e for e in excl):  # 前方一致ではなくフォルダ単位で比べる
             continue
         try:
             entries = list(os.scandir(d))
@@ -134,18 +135,54 @@ def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = N
 
 # ---------------------------------------------------------------- decide
 
-def _keep_score(f: FileInfo) -> tuple:
+# 残す候補としての場所の優先度（小さいほど残す）。撮影した元ファイル → 整理済みのフォルダ → その他 →
+# ダウンロード → メッセージアプリが保存したコピー、の順
+_LOCATION_RANK: tuple[tuple[re.Pattern, int], ...] = (
+    (re.compile(r"/DCIM/"), 0),
+    (re.compile(r"/(Pictures|Movies|Music|Documents|Recordings|Podcasts|Audiobooks)/"), 1),
+    (re.compile(r"/Download/"), 3),
+    (re.compile(r"/(Android/media|LINE|WhatsApp|Telegram|Messenger)/", re.I), 4),
+)
+
+
+def location_rank(path: str) -> int:
+    """消してよい側の印（ダウンロード・アプリのコピー）が 1 つでもあれば、親フォルダが何でもそちらを優先する。"""
+    ranks = [r for pat, r in _LOCATION_RANK if pat.search(path)]
+    worse = [r for r in ranks if r > 2]
+    better = [r for r in ranks if r < 2]
+    return max(worse) if worse else min(better, default=2)
+
+
+def is_protected(path: str, protect: Iterable[str]) -> bool:
+    rp = os.path.realpath(path)
+    for p in protect:
+        rr = os.path.realpath(p)
+        if os.path.commonpath([rp, rr]) == rr:
+            return True
+    return False
+
+
+def _keep_score(f: FileInfo, protect: Iterable[str]) -> tuple:
     stem = os.path.splitext(os.path.basename(f.path))[0]
-    return (bool(_COPY_MARK.search(stem)), "/DCIM/" not in f.path, f.mtime, len(f.path), f.path)
+    return (not is_protected(f.path, protect), location_rank(f.path), bool(_COPY_MARK.search(stem)),
+            f.mtime, len(f.path), f.path)
 
 
-def suggest_keep(g: DupGroup) -> int:
-    return min(range(len(g.files)), key=lambda i: _keep_score(g.files[i]))
+def suggest_keep(g: DupGroup, protect: Iterable[str] = ()) -> int:
+    protect = list(protect)
+    return min(range(len(g.files)), key=lambda i: _keep_score(g.files[i], protect))
+
+
+def to_trash(g: DupGroup, keep: int, protect: Iterable[str] = ()) -> list[FileInfo]:
+    """ゴミ箱へ移すファイル。残す 1 つと、保護フォルダ内のファイルは移さない。"""
+    protect = list(protect)
+    return [f for i, f in enumerate(g.files) if i != keep and not is_protected(f.path, protect)]
 
 
 JUDGE_PROMPT = """重複ファイル（中身が完全に同一）のグループごとに、残すファイルを 1 つ選ぶ。
-残す以外のファイルはゴミ箱へ移される（完全削除ではない）。
+残す以外のファイルはゴミ箱へ移される（完全削除ではない。[保護] の付いたファイルは常に残る）。
 選び方: 元の撮影・保存場所（DCIM 等）、コピー印の無い名前、古い日付を優先。
+LINE・WhatsApp などのアプリが保存したコピーやダウンロードは、消してよい側になりやすい。
 迷うグループ（別アプリが参照していそう等）は keep を null にして残す。
 出力は JSON 配列のみ: [{"g": グループ番号, "keep": ファイル番号 または null, "reason": "短い理由"}]"""
 
@@ -154,12 +191,14 @@ def _fmt_size(n: int) -> str:
     return f"{n / 1024**2:.1f}MB" if n >= 1024**2 else f"{n / 1024:.0f}KB"
 
 
-def render_groups(groups: list[DupGroup], offset: int = 0) -> str:
+def render_groups(groups: list[DupGroup], offset: int = 0, protect: Iterable[str] = ()) -> str:
+    protect = list(protect)
     out = []
     for gi, g in enumerate(groups, start=offset + 1):
         out.append(f"グループ{gi} ({_fmt_size(g.size)} × {len(g.files)})")
         for fi, f in enumerate(g.files):
-            out.append(f" {fi}: {f.path} ({time.strftime('%Y-%m-%d', time.localtime(f.mtime))})")
+            mark = " [保護]" if is_protected(f.path, protect) else ""
+            out.append(f" {fi}: {f.path} ({time.strftime('%Y-%m-%d', time.localtime(f.mtime))}){mark}")
     return "\n".join(out)
 
 
@@ -193,21 +232,34 @@ def parse_judgement(raw: str, groups: list[DupGroup], offset: int = 0) -> dict[i
     return out
 
 
-def judge_with_llm(llm: LLM, groups: list[DupGroup], batch: int = 8) -> list[Decision]:
+def judge_with_llm(llm: LLM, groups: list[DupGroup], batch: int = 8,
+                   protect: Iterable[str] = ()) -> list[Decision]:
+    protect = list(protect)
     decisions: list[Decision | None] = [None] * len(groups)
     for off in range(0, len(groups), batch):
         chunk = groups[off:off + batch]
         msgs = [{"role": "system", "content": JUDGE_PROMPT},
-                {"role": "user", "content": render_groups(chunk, off)}]
+                {"role": "user", "content": render_groups(chunk, off, protect)}]
         try:
             got = parse_judgement("".join(llm.stream(msgs)), chunk, off)
         except Exception:
             got = {}
         for gi, d in got.items():
             decisions[off + gi] = d
-    return [d or Decision(suggest_keep(g), "LLM 応答なし→既定ルール", "heuristic")
+    return [d or Decision(suggest_keep(g, protect), "LLM 応答なし→既定ルール", "heuristic")
             for d, g in zip(decisions, groups)]
 
 
-def judge_heuristic(groups: list[DupGroup]) -> list[Decision]:
-    return [Decision(suggest_keep(g), "コピー印なし・DCIM・古い順で選択", "heuristic") for g in groups]
+def judge_heuristic(groups: list[DupGroup], protect: Iterable[str] = ()) -> list[Decision]:
+    protect = list(protect)
+    return [Decision(suggest_keep(g, protect), "保護・保存場所・コピー印なし・古い順で選択", "heuristic")
+            for g in groups]
+
+
+def prune_cache(cache: dict[str, list], seen: Iterable[str]) -> int:
+    """今回の走査で見つからなかったファイル（削除・移動済み）のハッシュをキャッシュから消す。"""
+    keep = set(seen)
+    stale = [p for p in cache if p not in keep]
+    for p in stale:
+        del cache[p]
+    return len(stale)
