@@ -205,9 +205,35 @@ python -m jarvis_agent pending --apply      # 承認待ちを確認しながら�
 | タスク | 調べること | 提案（リスク） |
 |---|---|---|
 | optimize | 空きメモリ・空き容量、アプリごとのキャッシュ（`dumpsys diskstats`）、裏で動くアプリのメモリ（履歴を記録） | キャッシュ削除（低）、常習的に重いアプリの終了（低）、ほとんど使わない常習アプリのバックグラウンド制限（高）。詳細は下記 |
-| unused | `dumpsys usagestats` の全期間から最終使用日時、候補だけ `firstInstallTime` | 30 日以上未使用のアプリをアンインストール（高）。インストール直後のアプリと Termux / Shizuku は除外 |
+| unused | 使用履歴（前面・表示・他アプリからの利用）、端末の機能に組み込まれたアプリ、アプリ容量、候補の `firstInstallTime` | 30 日以上未使用のアプリを無効化（高・戻せる）→ 無効のまま 30 日でアンインストール（高）。詳細は下記 |
 | updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。詳細は下記 |
 | dupes | サイズ → 先頭 64KiB の SHA-256 → 全体の SHA-256。ハッシュはキャッシュ | 残す 1 つ以外をゴミ箱へ移動（高） |
+
+### 未使用アプリ（unused）
+
+- **使ったかどうか** は、使用履歴の `lastTimeUsed`（前面に出した）・`lastTimeVisible`（画面に見えた）・
+  `lastTimeComponentUsed`（ウィジェットや他のアプリから使われた）の最も新しい時刻で判断する
+- **端末の機能に組み込まれているアプリは対象外**（開かなくても使われているため。消すと電話や入力が壊れる）:
+  既定のホーム・SMS・電話・ブラウザ・アシスタントなどの役割を持つアプリ、有効なキーボード・ユーザー補助・
+  通知リスナー・自動入力（パスワード管理）・常時接続 VPN、端末管理アプリ、ホーム画面に置いたウィジェット、ライブ壁紙。
+  報告に「対象外」として名前を出す。実行の直前にも同じ確認をやり直す
+- インストール直後のアプリ・`unused_ignore`・利用者が自分で無効にしたアプリは対象外
+- アプリ本体 + データの容量（`dumpsys diskstats`）を表示し、**大きい順** に提案する
+- **段階的に整理する**（`unused_action: "disable"`、既定）:
+  1. まず **無効化**（`pm disable-user`）を提案。アプリは隠れて動かなくなるが、データは残る。
+     `disabled undo <パッケージ>` / `disabled undo all` で戻せる
+  2. 無効のまま `unused_uninstall_after_days`（30 日）たっても戻されなかったら、**アンインストール** を提案する
+  3. 利用者が自分で有効に戻したアプリは記録から外し、通常の判定に戻す
+
+  すぐにアンインストールを提案したい場合は `unused_action: "uninstall"`
+- 残したいアプリの提案は `pending --dismiss <ID>` で見送る。`dismiss_days`（90 日）の間は同じ提案を出さない
+  （他のタスクの提案にも使える）
+
+```sh
+python -m jarvis_agent disabled                # このエージェントが無効化したアプリの一覧
+python -m jarvis_agent disabled undo all       # すべて有効に戻す
+python -m jarvis_agent pending --dismiss <ID>  # 提案を見送る（ID は pending の左端）
+```
 
 ### アプリ最適化（optimize）
 
@@ -301,6 +327,9 @@ LLM には保護されたファイルに `[保護]` を付けて見せる。
   "dupe_exclude": ["/sdcard/Download/keep"],
   "trash_dir": "/sdcard/.jarvis_trash",
   "unused_days": 30,
+  "unused_action": "disable",
+  "unused_uninstall_after_days": 30,
+  "dismiss_days": 90,
   "unused_ignore": ["com.termux", "moe.shizuku.privileged.api"],
   "apk_dir": "/sdcard/Download",
   "bg_rss_mb": 300,
