@@ -22,4 +22,6 @@
 - `app/src/main/java/.../MainActivity.java` … 声・マイク・タイマー・アプリ起動・通信
 - `.github/workflows/build.yml` … push すると GitHub が自動で APK を作って Releases に置く
 
+- `agent/` … Termux 上で動くオンデバイス・エージェント（ADB/Shizuku で端末を操作、ローカル LLM）。詳細は [agent/README.md](agent/README.md)
+
 APIキーはコードに含めず、アプリ内の設定画面からスマホにだけ保存する。

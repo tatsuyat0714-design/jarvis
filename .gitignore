@@ -5,3 +5,5 @@ local.properties
 .idea/
 *.iml
 out/
+__pycache__/
+*.pyc
