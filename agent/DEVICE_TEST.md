@@ -459,17 +459,30 @@ python -m jarvis_agent daemon
 
 | 操作 | 期待するログ / 通知 |
 |---|---|
-| 画面 OFF | `event screen_off` → `task optimize: …`（提案があれば `承認待ち +N` と通知「ジャービス: optimize」） |
+| 画面 OFF → すぐ ON | `event screen_off` → `event screen_on`。タスクは **動かない** |
+| 画面 OFF のまま 5 分待つ | `event screen_idle` → `task optimize: …`（提案があれば `承認待ち +N` と通知「ジャービス: optimize」） |
 | 画面 ON | `event screen_on`、通知「承認待ちの提案が N 件あります」 |
-| 画面 ON のまま充電ケーブルを挿す | `rule charging-maintenance: 画面 ON のため OFF まで先送り` |
-| そのまま画面 OFF | `task updates` / `task unused` / `task dupes` が順に実行される |
+| 画面 ON のまま充電ケーブルを挿す | `rule charging-maintenance: 画面 OFF が続くまで先送り` |
+| 画面 OFF にして 5 分待つ | `event screen_idle` → `task updates` / `task unused` / `task dupes` が順に実行される |
+| dupes の実行中に画面 ON | `rule charging-maintenance: 画面が ON になったため中断します` → `task dupes: 中断しました` |
+| もう一度画面 OFF にして 5 分待つ | 中断したルールがやり直される |
 
 ※ 最後の dupes は既定の対象フォルダ（DCIM・Pictures・Download など）のハッシュを計算するので、初回は数分かかることがある。
 無人なので提案は承認待ちに入るだけで、ファイルは動かない
 
+待ち時間を短くして試すときは `~/.jarvis/config.json` に `{"idle_minutes": 1}` を書く（終わったら消す）。
+
+別の Termux セッションで状態を見る:
+
+```sh
+python -m jarvis_agent status
+```
+
 **確認すること**
 - [ ] 上の流れどおりに動く
-- [ ] 2 回目の画面 OFF では optimize が **動かない**（6 時間のクールダウン）
+- [ ] `status` に端末の状態（画面・充電・電池・温度）、実行中のタスク、各ルールの前回実行が出る
+- [ ] 2 回目の screen_idle では optimize が **動かない**（6 時間のクールダウン）
+- [ ] daemon を動かしたまま、別のセッションでもう一度 `daemon` を起動すると「既に動いています」で止まる
 - [ ] 30 分ほど放置したときの電池の減り（設定 → 電池 で Termux の使用量を見る）
 - [ ] Wi-Fi を一度 OFF → ON にしたとき、`接続エラー（N 回目、…秒後に再接続）` のあと復帰するか
   （ワイヤレスデバッグは Wi-Fi OFF で切れるので、復帰には再度 `connect` が必要な場合がある。挙動を記録する）

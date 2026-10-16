@@ -169,23 +169,55 @@ python -m jarvis_agent run "Wi-Fi の設定画面を開いて"
 python -m jarvis_agent events          # 検出したイベントを表示するだけ（動作確認用）
 python -m jarvis_agent daemon          # 常駐してルールに従いタスクを実行
 python -m jarvis_agent daemon --poll   # logcat が使えない端末向け
+python -m jarvis_agent status          # 常駐中の daemon の状態
+```
+
+```
+イベント源（logcat / ポーリング）─スレッド→ キュー → メインループ → ルール判定 → ワーカー（タスクを順に実行・中断可）
+                                                      └ タイマー: 画面 OFF が idle_minutes 続いたら screen_idle
 ```
 
 - **logcat ストリームで待ち受け**: `logcat -b events` の `screen_toggled` / `battery_status` / `battery_level` /
   `wm_resume_activity` だけを端末側で絞って受け取る。イベントが無い間は read でブロックしているだけなので CPU を使わない
 - 開始時刻を `-T` で端末の現在時刻にし、古いログで誤発火しない
 - 値は StateTracker を通し、**変化したときだけ** イベントにする（最初の観測値は基準として扱うだけ）
-- 切断時は 10 秒 → 20 秒 →…（最大 5 分）で再接続。3 回続けて失敗したらポーリングに切り替える
-- ポーリングは画面 ON 中 60 秒、OFF 中 300 秒間隔
+- **使っていない判定（screen_idle）**: 画面 OFF が `idle_minutes`（5 分）続いたら出す合成イベント。
+  画面を一瞬消しただけ・ポケットで点いた程度では重い処理を始めない
+- **タスクはワーカースレッドで実行** するので、数分かかる重複検出の間もイベントやタイマーを処理し続ける
+- **中断**: 画面が ON になったら「使っていない間だけ」のルール（充電中の保守）を、充電が外れたら「充電中だけ」の
+  ルールを中断する。重複検出はファイルを読む前ごとに中断を確かめ、そこまでのハッシュは保存して次回に使う。
+  中断したルールは実行済みにせず、条件がそろう次の機会（充電中の次の screen_idle）にやり直す
+- 重いタスク（unused / updates / dupes）は「充電中」か「電池 50% 以上」、かつ **電池温度が `heavy_max_temp_c`（40℃）未満**
+  のときだけ実行する（電池の温度は `battery_level` イベントから読む）
+- **切断と再接続**: 10 秒 → 20 秒 →…（最大 5 分）で再接続し、**切断中に起きた変化**（充電の抜き差しなど）も
+  再接続時の状態の差からイベントにする。3 回続けて失敗したらポーリングに切り替える（画面 ON 中 60 秒、OFF 中 300 秒間隔）
+- **二重起動しない**: `~/.jarvis/daemon.lock` で 1 つだけ動かす（Termux:Boot と手動起動が重なってもタスクは 1 回）
+- **状態の見える化**: `~/.jarvis/status.json` に端末の状態・実行中のタスク・待ち・先送り・各ルールの前回実行・
+  最近のイベントを書き、`status` で表示する
+- 実行ログ `log.jsonl` は 1MB を超えたら `log.jsonl.1` に回す
 
 | イベント | ルール | タスク | クールダウン |
 |---|---|---|---|
-| 充電開始 | charging-maintenance | updates / unused / dupes | 20 時間。画面 ON 中なら **OFF になるまで先送り**（充電が外れたら取り消し） |
-| 画面 OFF | screen-off-cleanup | optimize | 6 時間 |
+| 充電開始 | charging-maintenance | updates / unused / dupes | 20 時間。使っていない状態（screen_idle）になるまで先送り。充電が外れたら取り消し |
+| 画面 OFF が 5 分続く | idle-cleanup | optimize | 6 時間 |
 | 電池 15% を下回る（非充電） | low-battery | optimize | 2 時間 |
 | 画面 ON | screen-on-digest | 承認待ちがあれば通知 | 3 時間 |
 
-重いタスク（unused / updates / dupes）は「充電中」か「電池 50% 以上」のときだけ実行する。
+**ルールの変更**（`~/.jarvis/config.json`）: 名前ごとに `enabled` / `cooldown_h` / `tasks` / `hours`（実行してよい時間帯、
+日をまたいでもよい）を上書きできる。不正な値は無視して起動時に警告を出す。
+
+```json
+{
+  "idle_minutes": 5,
+  "heavy_max_temp_c": 40,
+  "rules": {
+    "charging-maintenance": {"hours": [0, 6], "cooldown_h": 24},
+    "idle-cleanup": {"enabled": false}
+  }
+}
+```
+
+`hours` の外で条件がそろった「使っていない間だけ」のルールは、時間帯に入った後の次の screen_idle まで待つ。
 通知は `termux-notification`（`pkg install termux-api` と Termux:API アプリ）。無ければ stderr に出す。
 Termux:Boot に `daemon` を登録すると再起動後も常駐する。
 

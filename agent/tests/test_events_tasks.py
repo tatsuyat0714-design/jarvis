@@ -101,7 +101,7 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(p("I/screen_toggled(  999): 0"), {"screen_on": False})
         self.assertEqual(p("I/battery_status( 1500): [2,2,1,2,Li-ion]"), {"plugged": True})
         self.assertEqual(p("I/battery_status( 1500): [3,2,1,0,Li-ion]"), {"plugged": False})
-        self.assertEqual(p("I/battery_level( 1500): [14,3700,301]"), {"level": 14})
+        self.assertEqual(p("I/battery_level( 1500): [14,3700,301]"), {"level": 14, "temp_c": 30.1})
         self.assertEqual(p("I/wm_resume_activity( 1500): [0,1234,42,com.android.chrome/com.google.Main,resume]"),
                          {"package": "com.android.chrome"})
         self.assertIsNone(p("--------- beginning of events"))
@@ -321,28 +321,32 @@ class DispatcherTest(Base):
         kw = {"rules": rules} if rules else {}
         return Dispatcher(self.ctx, tr, notify=lambda a, b: self.notes.append(b), log=lambda s: None, **kw)
 
-    def test_screen_off_runs_optimize_and_saves_pending(self):
+    def test_screen_idle_runs_optimize_and_saves_pending(self):
         d = self.make()
-        reps = d.handle(ev.Event(ev.SCREEN_OFF))
+        self.assertEqual(d.handle(ev.Event(ev.SCREEN_OFF)), [])          # 画面を消しただけでは動かない
+        reps = d.handle(ev.Event(ev.SCREEN_IDLE))
         self.assertEqual([r.task for r in reps], ["optimize"])
         self.assertTrue(self.store.pending())
         self.assertFalse(any("trim-caches" in c for c in self.t.calls))  # 無人では実行しない
-        self.assertEqual(d.handle(ev.Event(ev.SCREEN_OFF)), [])          # クールダウン
+        self.assertEqual(d.handle(ev.Event(ev.SCREEN_IDLE)), [])         # クールダウン
 
     def test_auto_apply_low_risk(self):
         self.store.config["auto_apply_low_risk"] = True
-        self.make().handle(ev.Event(ev.SCREEN_OFF))
+        self.make().handle(ev.Event(ev.SCREEN_IDLE))
         self.assertTrue(any("pm trim-caches" in c for c in self.t.calls))
         self.assertTrue(any("am kill jp.naver.line.android" in c for c in self.t.calls))
         self.assertEqual(self.store.pending(), [])
 
-    def test_charging_deferred_until_screen_off(self):
+    def test_charging_deferred_until_screen_idle(self):
         rules = (Rule("m", ev.CHARGING_START, ("updates",), 3600, require_charging=True, idle_only=True),)
         d = self.make(rules, screen_on=True)
         self.assertEqual(d.handle(ev.Event(ev.CHARGING_START)), [])
         self.assertIn("m", d.deferred)
         d.tracker.update(screen_on=False)
-        self.assertEqual([r.task for r in d.handle(ev.Event(ev.SCREEN_OFF))], ["updates"])
+        self.assertEqual(d.handle(ev.Event(ev.SCREEN_OFF)), [])  # まだ待つ
+        self.assertIn("m", d.deferred)
+        d.idle_due = None
+        self.assertEqual([r.task for r in d.handle(ev.Event(ev.SCREEN_IDLE))], ["updates"])
         self.assertEqual(d.deferred, {})
 
     def test_deferred_dropped_when_unplugged(self):
@@ -351,7 +355,8 @@ class DispatcherTest(Base):
         d.handle(ev.Event(ev.CHARGING_START))
         d.tracker.update(plugged=False)
         d.handle(ev.Event(ev.CHARGING_STOP))
-        self.assertEqual(d.handle(ev.Event(ev.SCREEN_OFF)), [])
+        d.tracker.update(screen_on=False)
+        self.assertEqual(d.handle(ev.Event(ev.SCREEN_IDLE)), [])
 
     def test_heavy_skipped_on_low_battery(self):
         rules = (Rule("x", ev.SCREEN_OFF, ("updates", "optimize"), 0),)

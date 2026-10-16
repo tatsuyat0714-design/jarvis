@@ -23,7 +23,9 @@ CHARGING_START = "charging_start"
 CHARGING_STOP = "charging_stop"
 BATTERY_LOW = "battery_low"
 APP_FOREGROUND = "app_foreground"
-EVENT_KINDS = (SCREEN_ON, SCREEN_OFF, CHARGING_START, CHARGING_STOP, BATTERY_LOW, APP_FOREGROUND)
+# 合成イベント: 画面 OFF が一定時間続いた（端末側には無い。daemon のタイマーが出す）
+SCREEN_IDLE = "screen_idle"
+EVENT_KINDS = (SCREEN_ON, SCREEN_OFF, SCREEN_IDLE, CHARGING_START, CHARGING_STOP, BATTERY_LOW, APP_FOREGROUND)
 
 # 必要なタグ以外は端末側で捨てる（*:S）。-T に端末の現在時刻を渡し、過去ログを流さず「今から」を読む
 LOGCAT_CMD = ("logcat -b events -v brief -T \"$(date '+%m-%d %H:%M:%S.000')\" "
@@ -48,6 +50,7 @@ class DeviceState:
     plugged: bool | None = None
     level: int | None = None
     package: str | None = None
+    temp_c: float | None = None   # 電池温度（重いタスクを避ける判断に使う）
 
 
 class StateTracker:
@@ -58,8 +61,11 @@ class StateTracker:
         self.low_level = low_level
 
     def update(self, screen_on: bool | None = None, plugged: bool | None = None,
-               level: int | None = None, package: str | None = None) -> list[Event]:
+               level: int | None = None, package: str | None = None,
+               temp_c: float | None = None) -> list[Event]:
         s, out = self.state, []
+        if temp_c is not None:
+            s.temp_c = temp_c
         if screen_on is not None:
             if s.screen_on is not None and screen_on != s.screen_on:
                 out.append(Event(SCREEN_ON if screen_on else SCREEN_OFF))
@@ -82,10 +88,12 @@ class StateTracker:
         battery = snap.data.get("battery")
         return self.update(screen_on=snap.get("power", "screen_on"),
                            plugged=bool(battery["plugged"]) if battery else None,
-                           level=snap.get("battery", "level"), package=snap.get("focus", "package"))
+                           level=snap.get("battery", "level"), package=snap.get("focus", "package"),
+                           temp_c=snap.get("battery", "temp_c"))
 
-    def seed(self, probe: DeviceProbe) -> None:
-        self.update_from(probe.snapshot(DeviceProbe.FAST, force=True))
+    def seed(self, probe: DeviceProbe) -> list[Event]:
+        """端末の今の状態を読み込む。前に知っていた状態との差（切断中に起きた変化）をイベントで返す。"""
+        return self.update_from(probe.snapshot(DeviceProbe.FAST, force=True))
 
 
 def parse_logcat_line(line: str) -> dict | None:
@@ -100,8 +108,11 @@ def parse_logcat_line(line: str) -> dict | None:
             return {"screen_on": fields[0].strip() == "1"}
         if tag == "battery_status":   # [status, health, present, plugged, technology]
             return {"plugged": int(fields[3]) != 0}
-        if tag == "battery_level":    # [level, voltage, temperature]
-            return {"level": int(fields[0])}
+        if tag == "battery_level":    # [level, voltage, temperature（0.1℃単位）]
+            out = {"level": int(fields[0])}
+            if len(fields) > 2 and fields[2].strip().lstrip("-").isdigit():
+                out["temp_c"] = int(fields[2]) / 10
+            return out
         if tag in ("wm_resume_activity", "am_resume_activity"):
             c = _COMPONENT.search(body)
             return {"package": c.group(1)} if c else None

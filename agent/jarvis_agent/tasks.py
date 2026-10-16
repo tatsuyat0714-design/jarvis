@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable
@@ -64,12 +65,21 @@ class Report:
     elapsed_ms: float = 0.0
 
 
+class TaskCancelled(Exception):
+    """daemon が中断を求めた（画面が ON になった・充電が外れた）。"""
+
+
 @dataclass
 class TaskContext:
     transport: Transport
     store: Store
     llm: LLM | None = None
     now: float = field(default_factory=time.time)
+    cancel: threading.Event | None = None
+
+    def check_cancel(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise TaskCancelled()
 
     @property
     def cfg(self) -> dict:
@@ -400,6 +410,7 @@ def unused(ctx: TaskContext) -> Report:
     if not users or not usage:
         # 使用履歴が読めないまま判定すると「全アプリ未使用」になるので、提案は出さない
         raise TaskError("アプリ一覧または使用履歴を取得できませんでした")
+    ctx.check_cancel()
     disabled_now = parse_pkg_list(raw.get("disabled", ""))
     sizes = parse_app_sizes(raw.get("disk", ""))
     integrated = parse_integrated(raw)
@@ -529,6 +540,7 @@ def updates(ctx: TaskContext) -> Report:
     ctx.store.state["inventory"] = inv
     ctx.store.save()
 
+    ctx.check_cancel()
     apks, notes = _local_apks(ctx.cfg["apk_dir"])
     rep.details += notes
     for pkg, (path, info) in sorted(apks.items()):
@@ -557,9 +569,16 @@ def updates(ctx: TaskContext) -> Report:
 
 def dupes(ctx: TaskContext) -> Report:
     protect = ctx.cfg["dupe_protect"]
-    files = list(dp.walk(ctx.cfg["dupe_roots"], ctx.cfg["dupe_min_bytes"],
-                         exclude=[ctx.cfg["trash_dir"], *ctx.cfg["dupe_exclude"]]))
-    groups = dp.find_duplicates(files, ctx.store.hashes)
+    files = []
+    for i, f in enumerate(dp.walk(ctx.cfg["dupe_roots"], ctx.cfg["dupe_min_bytes"],
+                                  exclude=[ctx.cfg["trash_dir"], *ctx.cfg["dupe_exclude"]])):
+        if i % 200 == 0:
+            ctx.check_cancel()
+        files.append(f)
+    try:
+        groups = dp.find_duplicates(files, ctx.store.hashes, check=ctx.check_cancel)
+    finally:
+        ctx.store.save_hashes()  # 中断しても、そこまでに計算したハッシュは次回に使う
     dp.prune_cache(ctx.store.hashes, (f.path for f in files))
     ctx.store.save_hashes()
     decisions = (dp.judge_with_llm(ctx.llm, groups, protect=protect) if ctx.llm

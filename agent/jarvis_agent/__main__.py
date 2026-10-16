@@ -19,6 +19,7 @@
                                                  optimize でバックグラウンドを制限したアプリの一覧・解除
   python -m jarvis_agent events [--poll]         イベントを表示するだけ（トリガーの動作確認）
   python -m jarvis_agent daemon [--poll]         イベント駆動で常駐し、ルールに従ってタスクを実行
+  python -m jarvis_agent status                  常駐中の daemon の状態（実行中のタスク・待ち・ルール）
 
 共通: --fixture FILE / --ui-fixture FILE で実機の代わりに保存済みの出力を使う。
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,7 +38,8 @@ from . import trash
 from . import ui
 from .dupes import sha256_file
 from .agent import Action, Agent, LLMPlanner, StepLog
-from .daemon import Dispatcher, run_forever
+from .daemon import (DEFAULT_RULES, DaemonError, Dispatcher, ThreadRunner, acquire_lock, apply_overrides,
+                     run_forever, write_status_file)
 from .context import build_messages, render
 from .device import DeviceProbe, build_script
 from .llm import DEFAULT_URL, EchoLLM, LLMError, LocalLLM
@@ -143,6 +146,41 @@ def trash_cmd(args, store: Store) -> int:
     return 0
 
 
+def _alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def status_cmd(store: Store) -> int:
+    try:
+        st = json.loads((store.root / "status.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print("daemon の状態がありません（まだ起動していない）")
+        return 1
+    alive = _alive(st.get("pid"))
+    age = int(time.time() - st.get("updated", 0))
+    print(f"daemon: {'動作中' if alive else '停止'}（pid {st.get('pid')}、{age} 秒前に更新）")
+    d = st.get("device", {})
+    onoff = {True: "ON", False: "OFF", None: "?"}
+    temp = f"{d.get('temp_c'):.0f}℃" if d.get("temp_c") is not None else "?"
+    print(f"端末: 画面 {onoff[d.get('screen_on')]} / 充電 {onoff[d.get('plugged')]} / "
+          f"電池 {d.get('level', '?')}% / {temp}")
+    if st.get("idle_in_s") is not None:
+        print(f"あと {st['idle_in_s']} 秒で「使っていない」とみなす")
+    print(f"実行中: {st.get('running') or 'なし'} / 待ち: {st.get('queued', 0)} / "
+          f"先送り: {', '.join(st.get('deferred', [])) or 'なし'}")
+    for r in st.get("rules", []):
+        last = time.strftime("%m-%d %H:%M", time.localtime(r["last_run"])) if r.get("last_run") else "未実行"
+        mark = "" if r.get("enabled", True) else "（無効）"
+        print(f"  {r['name']}{mark}: {r['on']} → {', '.join(r['tasks']) or '通知'}（前回 {last}）")
+    if st.get("recent_events"):
+        print("最近のイベント: " + " / ".join(st["recent_events"][-5:]))
+    return 0 if alive else 1
+
+
 def print_log(e: StepLog) -> None:
     print(f"[{e.state.value:<7}] {e.detail}", file=sys.stderr)
 
@@ -209,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
     ru = rts.add_parser("undo")
     ru.add_argument("package", help="パッケージ名、または all")
 
+    sub.add_parser("status")
+
     for name in ("events", "daemon"):
         d = sub.add_parser(name)
         d.add_argument("--poll", action="store_true", help="logcat を使わずポーリングで監視")
@@ -218,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
     probe = DeviceProbe(transport)
 
     try:
+        if args.cmd == "status":
+            return status_cmd(Store())
+
         if args.cmd == "trash":
             return trash_cmd(args, Store())
 
@@ -299,8 +342,16 @@ def main(argv: list[str] | None = None) -> int:
                     review(items, ctx, store)
                 return 0
 
-            tracker = ev.StateTracker()
-            run_forever(ctx, Dispatcher(ctx, tracker), poll=args.poll)
+            rules, warnings = apply_overrides(DEFAULT_RULES, store.config.get("rules", {}))
+            for w in warnings:
+                print(f"設定の警告: {w}", file=sys.stderr)
+            lock = acquire_lock(str(store.root / "daemon.lock"))
+            try:
+                dispatcher = Dispatcher(ctx, ev.StateTracker(), rules, runner=ThreadRunner())
+                run_forever(ctx, dispatcher, poll=args.poll,
+                            write_status=write_status_file(str(store.root / "status.json")))
+            finally:
+                lock.close()
             return 0
 
         if args.cmd == "events":
@@ -362,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except (TransportError, LLMError, ui.UiError, TaskError, trash.TrashError) as e:
+    except (TransportError, LLMError, ui.UiError, TaskError, trash.TrashError, DaemonError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

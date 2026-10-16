@@ -53,6 +53,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "optimize_ignore": [],
     # 低リスクの提案（キャッシュ削除・バックグラウンドプロセス終了）を無人時に自動実行するか
     "auto_apply_low_risk": False,
+    # daemon: 画面 OFF がこの分数続いたら「使っていない」（screen_idle）とみなす
+    "idle_minutes": 5,
+    # daemon: 電池温度がこの ℃ 以上なら重いタスクを実行しない
+    "heavy_max_temp_c": 40,
+    # daemon: ルールの上書き。{"ルール名": {"enabled": bool, "cooldown_h": 数, "tasks": [...], "hours": [開始, 終了]}}
+    "rules": {},
 }
 
 
@@ -134,7 +140,15 @@ class Store:
             _write(self.root / "hashes.json", self._hashes)
 
     # ---- log
+    LOG_MAX_BYTES = 1024 * 1024
+
     def log(self, entry: dict) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        with open(self.root / "log.jsonl", "a", encoding="utf-8") as f:
+        path = self.root / "log.jsonl"
+        try:
+            if path.stat().st_size > self.LOG_MAX_BYTES:
+                os.replace(path, self.root / "log.jsonl.1")  # 1 世代だけ残す
+        except FileNotFoundError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"t": time.time(), **entry}, ensure_ascii=False) + "\n")
