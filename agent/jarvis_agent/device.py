@@ -36,11 +36,16 @@ SECTIONS: dict[str, str] = {
 }
 
 
-def build_script(names: list[str]) -> str:
+def build_script(names: list[str], table: dict[str, str] = SECTIONS) -> str:
     parts = []
     for n in names:
-        parts.append(f"echo '{MARK}{n}'; {{ {SECTIONS[n]}; }} 2>/dev/null")
+        parts.append(f"echo '{MARK}{n}'; {{ {table[n]}; }} 2>/dev/null")
     return "; ".join(parts)
+
+
+def run_sections(transport: Transport, table: dict[str, str], timeout: float = 20.0) -> dict[str, str]:
+    """任意のコマンド表を 1 回の shell 呼び出しで実行し、セクションごとの出力を返す。"""
+    return split_sections(transport.shell(build_script(list(table), table), timeout=timeout).stdout)
 
 
 def split_sections(stdout: str) -> dict[str, str]:

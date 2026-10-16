@@ -19,6 +19,12 @@ from typing import Iterable, Iterator
 from .transport import Transport
 
 DUMP_PATH = "/sdcard/jarvis_ui.xml"
+PACKAGE_RE = re.compile(r"[a-zA-Z]\w*(\.\w+)+")
+
+
+def valid_package(name: str) -> bool:
+    return bool(PACKAGE_RE.fullmatch(name))
+
 _BOUNDS = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
@@ -182,6 +188,6 @@ def key(transport: Transport, keycode: str) -> None:
 
 
 def launch(transport: Transport, package: str) -> None:
-    if not re.fullmatch(r"[a-zA-Z][\w]*(\.[\w]+)+", package):
+    if not valid_package(package):
         raise UiError(f"不正なパッケージ名: {package}")
     transport.shell(f"monkey -p {package} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1")

@@ -11,7 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Iterator, Mapping, Protocol
 
 WRAPPER = Path(__file__).resolve().parent.parent / "bin" / "adbw.sh"
 
@@ -34,6 +34,10 @@ class TransportError(RuntimeError):
 
 class Transport(Protocol):
     def shell(self, script: str, timeout: float = 10.0) -> ShellResult: ...
+
+    def stream(self, script: str) -> Iterator[str]:
+        """終わらないコマンド（logcat 等）の出力を 1 行ずつ返す。"""
+        ...
 
 
 class WrapperTransport:
@@ -63,14 +67,33 @@ class WrapperTransport:
             raise TransportError(proc.stderr.strip())
         return ShellResult(proc.stdout, proc.stderr, proc.returncode, elapsed)
 
+    def stream(self, script: str) -> Iterator[str]:
+        proc = subprocess.Popen(["bash", str(self.wrapper), "stream", script], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, errors="replace", env=self.env)
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                yield line.rstrip("\n")
+        finally:
+            proc.kill()
+            proc.wait()
+        # ここに来るのはストリームが自然に終わったとき（接続切れ・ラッパーのエラー）
+        err = proc.stderr.read() if proc.stderr else ""
+        raise TransportError(err.strip() or f"stream ended (exit {proc.returncode})")
+
 
 class FakeTransport:
     """スクリプト文字列を受け取り stdout を返す関数で応答する。"""
 
-    def __init__(self, responder: Callable[[str], str]):
+    def __init__(self, responder: Callable[[str], str], stream_lines: list[str] | None = None):
         self.responder = responder
+        self.stream_lines = stream_lines or []
         self.calls: list[str] = []
 
     def shell(self, script: str, timeout: float = 10.0) -> ShellResult:
         self.calls.append(script)
         return ShellResult(self.responder(script), "", 0, 0.0)
+
+    def stream(self, script: str) -> Iterator[str]:
+        self.calls.append(script)
+        yield from self.stream_lines

@@ -12,6 +12,7 @@
 #   adbw.sh pair <host:port> <code>   ワイヤレスデバッグのペアリング（初回のみ）
 #   adbw.sh connect [host:port]       ADB over TCP に接続
 #   adbw.sh shell <script>            デバイス側シェルで実行（stdout/exit code をそのまま返す）
+#   adbw.sh stream <script>           タイムアウト無しで実行（logcat などの常駐ストリーム用）
 #   adbw.sh status                    使用中のバックエンドと接続状態を表示
 #   adbw.sh doctor                    環境チェック
 
@@ -63,6 +64,16 @@ cmd_shell() {
     esac
 }
 
+cmd_stream() {
+    [ $# -ge 1 ] || die "stream: 実行するスクリプトを指定してください"
+    local script="$*"
+    resolve_backend
+    case "$BACKEND" in
+        shizuku) exec rish -c "$script" ;;
+        adb)     ensure_adb; exec adb -s "$ADB_HOST" shell "$script" ;;
+    esac
+}
+
 cmd_status() {
     resolve_backend
     echo "backend=$BACKEND"
@@ -87,7 +98,8 @@ case "$sub" in
     pair)    have adb || die "adb がありません"; [ $# -eq 2 ] || die "pair <host:port> <code>"; adb pair "$1" "$2" ;;
     connect) [ $# -ge 1 ] && ADB_HOST="$1"; ensure_adb && echo "connected $ADB_HOST" ;;
     shell)   cmd_shell "$@" ;;
+    stream)  cmd_stream "$@" ;;
     status)  cmd_status ;;
     doctor)  cmd_doctor ;;
-    *)       sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *)       sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

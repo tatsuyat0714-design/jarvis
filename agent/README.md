@@ -5,6 +5,7 @@ Termux 上で動き、ADB over TCP / Shizuku 経由で端末の状態を取得�
 
 - 0.1: 端末情報取得 → コンパクトなコンテキスト化 → ローカル LLM へストリーミング問い合わせ
 - 0.2: UI 解析（uiautomator dump のキーワード高速パース）と、操作のステートマシン
+- 0.3: イベント駆動トリガー（logcat 常駐）と定型タスク（最適化・未使用アプリ・更新・重複ファイル）
 
 ## 構成
 
@@ -18,6 +19,11 @@ agent/
 │   ├── llm.py               ローカル推論サーバー（OpenAI 互換）クライアント
 │   ├── ui.py                UI ダンプ解析（キーワード検索・座標算出）と tap / text / key / launch
 │   ├── agent.py             ステートマシン（OBSERVE→PLAN→CONFIRM→ACT→VERIFY）とプランナー
+│   ├── events.py            イベント検出（logcat ストリーム / ポーリング）と状態変化の追跡
+│   ├── daemon.py            イベント → ルール → タスクの常駐ディスパッチャ
+│   ├── tasks.py             定型タスクと、提案の検証・実行（apply）
+│   ├── dupes.py             重複ファイル検出と「残す 1 つ」の判断（既定ルール / LLM）
+│   ├── store.py             永続状態（~/.jarvis/）
 │   └── __main__.py          メインコントローラー（CLI）
 └── tests/                   python -m unittest discover -s tests
 ```
@@ -46,7 +52,8 @@ python CLI ──> WrapperTransport ──> adbw.sh ──┬─> adb -s 127.0.0
 ## セットアップ（Termux）
 
 ```sh
-pkg install python android-tools git
+pkg install python android-tools git termux-api aapt
+termux-setup-storage   # 重複検出で /sdcard を読むため
 git clone <このリポジトリ> && cd jarvis/agent
 ```
 
@@ -152,7 +159,73 @@ python -m jarvis_agent run "Wi-Fi の設定画面を開いて"
 - `ScriptedPlanner`: 決まった手順を順に実行（定型タスク・テスト用）
 - `max_steps`（既定 15）で無限ループを防止
 
-## 今後の実装順
+## イベント駆動トリガー（events.py / daemon.py）
 
-1. **イベント駆動トリガー**: 画面点灯・充電開始・アプリ起動を契機に FAST プローブのみ実行（常時ポーリングしない）
-2. **タスク**: キャッシュクリア / バックグラウンド監視、`dumpsys usagestats` による未使用アプリ抽出、バージョン差分チェック、サイズ→SHA-256 の重複検出（削除は CONFIRM 経由）
+```sh
+python -m jarvis_agent events          # 検出したイベントを表示するだけ（動作確認用）
+python -m jarvis_agent daemon          # 常駐してルールに従いタスクを実行
+python -m jarvis_agent daemon --poll   # logcat が使えない端末向け
+```
+
+- **logcat ストリームで待ち受け**: `logcat -b events` の `screen_toggled` / `battery_status` / `battery_level` /
+  `wm_resume_activity` だけを端末側で絞って受け取る。イベントが無い間は read でブロックしているだけなので CPU を使わない
+- 開始時刻を `-T` で端末の現在時刻にし、古いログで誤発火しない
+- 値は StateTracker を通し、**変化したときだけ** イベントにする（最初の観測値は基準として扱うだけ）
+- 切断時は 10 秒 → 20 秒 →…（最大 5 分）で再接続。3 回続けて失敗したらポーリングに切り替える
+- ポーリングは画面 ON 中 60 秒、OFF 中 300 秒間隔
+
+| イベント | ルール | タスク | クールダウン |
+|---|---|---|---|
+| 充電開始 | charging-maintenance | updates / unused / dupes | 20 時間。画面 ON 中なら **OFF になるまで先送り**（充電が外れたら取り消し） |
+| 画面 OFF | screen-off-cleanup | optimize | 6 時間 |
+| 電池 15% を下回る（非充電） | low-battery | optimize | 2 時間 |
+| 画面 ON | screen-on-digest | 承認待ちがあれば通知 | 3 時間 |
+
+重いタスク（unused / updates / dupes）は「充電中」か「電池 50% 以上」のときだけ実行する。
+通知は `termux-notification`（`pkg install termux-api` と Termux:API アプリ）。無ければ stderr に出す。
+Termux:Boot に `daemon` を登録すると再起動後も常駐する。
+
+## タスク（tasks.py / dupes.py）
+
+```sh
+python -m jarvis_agent task optimize        # 実行して、提案を 1 件ずつ確認しながら実行
+python -m jarvis_agent task dupes --llm     # 重複の「残す 1 つ」をローカル LLM に判断させる
+python -m jarvis_agent task unused --save   # 確認せず承認待ちに保存
+python -m jarvis_agent pending --apply      # 承認待ちを確認しながら実行
+```
+
+| タスク | 調べること | 提案（リスク） |
+|---|---|---|
+| optimize | 空き容量、`ps` の RSS 上位（前面アプリ・システムを除くユーザーアプリ） | `pm trim-caches`（低）、300MB 以上のバックグラウンドアプリを `am kill`（低） |
+| unused | `dumpsys usagestats` の全期間から最終使用日時、候補だけ `firstInstallTime` | 30 日以上未使用のアプリをアンインストール（高）。インストール直後のアプリと Termux / Shizuku は除外 |
+| updates | `dumpsys package` の versionCode / versionName を前回の記録と比較（更新・追加・削除） | `apk_dir` にある、インストール済みより新しい APK で `pm install -r`（高）。要 `pkg install aapt` |
+| dupes | サイズ → 先頭 64KiB の SHA-256 → 全体の SHA-256。ハッシュはキャッシュ | 残す 1 つ以外をゴミ箱へ移動（高） |
+
+### 安全のための設計
+
+- **タスクは調べて提案するだけ**。変更は `apply()` を通ったときだけ起こる
+- 提案は **(種類, 引数) の構造データ**で、シェル文字列は保存しない。`apply()` が引数を検証してからコマンドを組み立てる
+  （パッケージ名の形式、実行直前の「ユーザーアプリか」の再確認、APK は `apk_dir` の中だけ）
+- **無人では高リスクの提案を実行しない**。低リスクも `auto_apply_low_risk: true` のときだけ自動実行
+- 使用履歴が取れなかったときは unused を中止する（「全アプリ未使用」と誤判定しないため）
+- 重複の削除は **完全削除ではなくゴミ箱（`/sdcard/.jarvis_trash/日時/元のパス`）へ移動**。移動の直前に、残す側と移動する側を
+  読み直してハッシュが一致することを確かめる。残す側が変わっていたら何もしない
+- LLM の判断は **「残すファイルの番号」だけ**を返させる。パスを書かせないので、グループ外のファイルを指定できない。
+  不正な応答は既定ルールに戻し、`keep: null`（迷う）なら何も消さない
+
+### 設定（`~/.jarvis/config.json`、書いた項目だけ既定値を上書き）
+
+```json
+{
+  "dupe_roots": ["/sdcard/DCIM", "/sdcard/Pictures", "/sdcard/Download"],
+  "dupe_min_bytes": 1048576,
+  "unused_days": 30,
+  "unused_ignore": ["com.termux", "moe.shizuku.privileged.api"],
+  "apk_dir": "/sdcard/Download",
+  "bg_rss_mb": 300,
+  "auto_apply_low_risk": false
+}
+```
+
+状態は `~/.jarvis/`（`JARVIS_HOME` で変更可）に保存する: `state.json`（クールダウン・アプリ一覧・承認待ち）、
+`hashes.json`（ハッシュキャッシュ）、`log.jsonl`（実行ログ）。
