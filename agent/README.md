@@ -3,8 +3,8 @@
 Termux 上で動き、ADB over TCP / Shizuku 経由で端末の状態を取得し、
 ローカル LLM（llama.cpp / MLC LLM）へコンテキストとして渡す。外部 API は使わない。
 
-現在のバージョン（0.1）は **基盤となる最小構成**:
-端末情報取得 → コンパクトなコンテキスト化 → ローカル LLM へストリーミング問い合わせ。
+- 0.1: 端末情報取得 → コンパクトなコンテキスト化 → ローカル LLM へストリーミング問い合わせ
+- 0.2: UI 解析（uiautomator dump のキーワード高速パース）と、操作のステートマシン
 
 ## 構成
 
@@ -16,6 +16,8 @@ agent/
 │   ├── device.py            端末情報の一括取得とパース（DeviceProbe）
 │   ├── context.py           LLM 用コンテキスト生成
 │   ├── llm.py               ローカル推論サーバー（OpenAI 互換）クライアント
+│   ├── ui.py                UI ダンプ解析（キーワード検索・座標算出）と tap / text / key / launch
+│   ├── agent.py             ステートマシン（OBSERVE→PLAN→CONFIRM→ACT→VERIFY）とプランナー
 │   └── __main__.py          メインコントローラー（CLI）
 └── tests/                   python -m unittest discover -s tests
 ```
@@ -109,10 +111,48 @@ Wi-Fi: ON HomeNet-5G
 
 機種によってパースが崩れた場合は `capture` した出力を `tests/fixtures/` に追加してテスト化する。
 
+## UI 解析（ui.py）
+
+```sh
+python -m jarvis_agent ui screen               # 操作可能な要素だけを一覧（LLM に渡すのと同じ形）
+python -m jarvis_agent ui find キャッシュ 戻る  # 一致した要素と中心座標
+python -m jarvis_agent ui find 戻る --tap      # 最上位の候補をタップ
+```
+
+- **全画面の木を作らない**: `iterparse` でノードを 1 つずつ流し、キーワードに一致したものだけ残す
+- 照合対象は `text` / `content-desc` / `hint` / `resource-id`、大文字小文字は区別しない
+- 文言を持たない押せるコンテナ（LinearLayout など）は、子孫の文言で見つかる
+- 面積 0・`enabled=false` の要素は候補から外す。候補は「押せる要素 → 面積が小さい順」
+- `summarize()` は画面のハッシュも返し、操作後に画面が変わったかの判定に使う
+- **パスワード欄**（`password="true"`）の文字列は読み取らず、LLM にも渡さない。入力も行わない
+- `input text` は ASCII のみ（Android の制約）。引数はすべてシェル用にエスケープ・検証済み
+
+## ステートマシン（agent.py）
+
+```
+IDLE ─> OBSERVE ─> PLAN ─┬─> ACT ─> VERIFY ─> OBSERVE …
+                          ├─> CONFIRM ─承認─> ACT
+                          │           └拒否─> DONE
+                          └─ done ───> DONE        （例外・max_steps 超過は ERROR）
+```
+
+```sh
+python -m jarvis_agent run "Wi-Fi の設定画面を開いて"
+```
+
+| 状態 | 内容 |
+|---|---|
+| OBSERVE | 端末情報（FAST のみ）＋ 画面要素の一覧。直前の VERIFY のダンプを流用し、dump は 1 手 1 回 |
+| PLAN | プランナーが **次の一手だけ** を JSON で返す。毎回観測し直すので、想定外のダイアログにも追従できる |
+| CONFIRM | 対象の文言に「削除・消去・アンインストール・購入・送信…」を含む操作は人に確認。無人実行（stdin が端末でない）では常に拒否 |
+| ACT | `tap` / `type` / `key` / `launch` / `wait` の 5 種だけ。任意のシェルコマンドは実行できない |
+| VERIFY | 画面ハッシュを比べ、変化が無ければ履歴に「画面変化なし」と残して次の PLAN に伝える |
+
+- `LLMPlanner`: ローカル LLM に JSON を出させ、形式・アクション種別・キーコードを検査。不正なら 1 回だけ再要求
+- `ScriptedPlanner`: 決まった手順を順に実行（定型タスク・テスト用）
+- `max_steps`（既定 15）で無限ループを防止
+
 ## 今後の実装順
 
-1. **UI 解析**: `uiautomator dump` の XML をキーワード指定でストリーミングパース（`iterparse` で一致ノードだけ拾う）→ `bounds` から中心座標 → `input tap` / `input text`
-2. **ステートマシン**: `IDLE → OBSERVE → PLAN(LLM) → CONFIRM → ACT → VERIFY → IDLE`。破壊的操作（アンインストール・削除）は必ず CONFIRM を通す
-3. **イベント駆動トリガー**: 画面点灯・充電開始・アプリ起動を契機に FAST プローブのみ実行（常時ポーリングしない）
-4. **タスク**: キャッシュクリア / バックグラウンド監視、`UsageStatsManager`（`dumpsys usagestats`）による未使用アプリ抽出、バージョン差分チェック、サイズ→SHA-256 の重複検出、自動ログイン
-5. **機密情報**: Android Keystore で保護した値を、コンパニオンアプリ経由でのみエージェントへ渡す（Termux 側には平文で置かない）
+1. **イベント駆動トリガー**: 画面点灯・充電開始・アプリ起動を契機に FAST プローブのみ実行（常時ポーリングしない）
+2. **タスク**: キャッシュクリア / バックグラウンド監視、`dumpsys usagestats` による未使用アプリ抽出、バージョン差分チェック、サイズ→SHA-256 の重複検出（削除は CONFIRM 経由）
