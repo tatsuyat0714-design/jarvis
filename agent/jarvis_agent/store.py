@@ -57,6 +57,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "idle_minutes": 5,
     # daemon: 電池温度がこの ℃ 以上なら重いタスクを実行しない
     "heavy_max_temp_c": 40,
+    # daemon: wake lock（CPU をスリープさせない）を取る範囲。"tasks" = タスク実行中だけ（既定・電池に最も優しい）、
+    # "always" = 常駐中ずっと、"never" = 取らない。待機中は端末がスリープしてよく、イベントは起きた時にまとめて届く
+    "wake_lock": "tasks",
     # daemon: ルールの上書き。{"ルール名": {"enabled": bool, "cooldown_h": 数, "tasks": [...], "hours": [開始, 終了]}}
     "rules": {},
 }
@@ -138,6 +141,10 @@ class Store:
     def save_hashes(self) -> None:
         if self._hashes is not None:
             _write(self.root / "hashes.json", self._hashes)
+
+    def drop_caches(self) -> None:
+        """ハッシュ表をメモリから外す（保存済み。次に使う時に読み直す）。常駐 daemon がタスクの後に呼ぶ。"""
+        self._hashes = None
 
     # ---- log
     LOG_MAX_BYTES = 1024 * 1024

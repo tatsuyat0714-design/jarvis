@@ -17,11 +17,18 @@
 ルールを中断する。中断したルールは実行済みにせず、条件がそろう次の機会にやり直す。
 重いタスクは、充電中または電池 50% 以上、かつ電池温度が heavy_max_temp_c 未満のときだけ実行する。
 提案は無人では実行しない。低リスクの提案だけ、設定 auto_apply_low_risk が true なら自動実行する。
+
+常駐の軽さ:
+- イベントもタイマーも無い間は完全に眠る（定期的に起きない）。状態ファイルは中身が変わった時だけ書く
+- logcat はルールが使うタグだけ読む（アプリ切り替えは既定では読まない）。ポーリングは電池と画面だけ
+- タスクは優先度を下げたワーカースレッドで動かし（nice）、終わったらハッシュ表などを手放す
+- wake lock はタスクの実行中だけ取る。待っている間は端末が普通にスリープできる
 """
 
 from __future__ import annotations
 
 import dataclasses
+import gc
 import json
 import os
 import queue
@@ -39,6 +46,7 @@ from .tasks import TASKS, Report, TaskCancelled, TaskContext, apply, run_task
 from .transport import TransportError
 
 HEAVY_MIN_LEVEL = 50
+WORKER_NICE = 10   # タスク（と、そこから起動する adb など）の CPU・I/O 優先度を下げ、使用中のアプリを邪魔しない
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,11 @@ def apply_overrides(rules: tuple[Rule, ...], overrides: dict) -> tuple[tuple[Rul
     return tuple(by_name[r.name] for r in rules), warnings
 
 
+def needs_foreground(rules: tuple[Rule, ...]) -> bool:
+    """アプリ切り替えを使う有効なルールがあるか。無ければ logcat・ポーリングで前面アプリを追わない。"""
+    return any(r.enabled and r.on == ev.APP_FOREGROUND for r in rules)
+
+
 def in_hours(hours: tuple[int, int] | None, t: float) -> bool:
     if hours is None:
         return True
@@ -109,6 +122,12 @@ def termux_notify(title: str, text: str) -> None:
                        timeout=10, check=False)
     else:
         print(f"[通知] {title}: {text}", file=sys.stderr)
+
+
+def termux_wake_lock(on: bool) -> None:
+    cmd = "termux-wake-lock" if on else "termux-wake-unlock"
+    if shutil.which(cmd):
+        subprocess.run([cmd], timeout=10, check=False)
 
 
 # ---------------------------------------------------------------- runners
@@ -126,8 +145,9 @@ class InlineRunner:
 class ThreadRunner:
     """1 本のワーカースレッドで順に実行する。イベント処理（タイマー・中断）を止めないため。"""
 
-    def __init__(self):
+    def __init__(self, nice: int = WORKER_NICE):
         self.q: queue.Queue = queue.Queue()
+        self.nice = nice
         threading.Thread(target=self._loop, name="jarvis-worker", daemon=True).start()
 
     def submit(self, fn: Callable[[], list[Report]]) -> list[Report]:
@@ -138,6 +158,11 @@ class ThreadRunner:
         return self.q.qsize()
 
     def _loop(self) -> None:
+        if self.nice:
+            try:  # Linux の nice はスレッド単位。このスレッドが起動する子プロセスにも引き継がれる
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), self.nice)
+            except (AttributeError, OSError):
+                pass
         while True:
             fn = self.q.get()
             try:
@@ -152,7 +177,8 @@ class Dispatcher:
     def __init__(self, ctx: TaskContext, tracker: ev.StateTracker, rules: tuple[Rule, ...] = DEFAULT_RULES,
                  notify: Callable[[str, str], None] = termux_notify,
                  log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
-                 runner=None, clock: Callable[[], float] = time.time):
+                 runner=None, clock: Callable[[], float] = time.time,
+                 wake_lock: Callable[[bool], None] = termux_wake_lock):
         self.ctx = ctx
         self.tracker = tracker
         self.rules = rules
@@ -160,6 +186,7 @@ class Dispatcher:
         self.log = log
         self.runner = runner or InlineRunner()
         self.clock = clock
+        self.wake_lock = wake_lock
         self._lock = threading.Lock()
         self.deferred: dict[str, Rule] = {}
         self.idle_due: float | None = None
@@ -255,6 +282,9 @@ class Dispatcher:
         self.on_change()
         reports: list[Report] = []
         cancelled = False
+        hold = bool(r.tasks) and self.ctx.cfg.get("wake_lock", "tasks") == "tasks"
+        if hold:
+            self.wake_lock(True)   # タスクの途中で端末がスリープしないように（終わったらすぐ放す）
         try:
             for name in r.tasks:
                 if token.is_set():
@@ -284,6 +314,8 @@ class Dispatcher:
                 reports.append(rep)
                 self._handle_proposals(rep)
         finally:
+            if hold:
+                self.wake_lock(False)
             with self._lock:
                 self.running = None
                 self.cancel = threading.Event()
@@ -294,8 +326,15 @@ class Dispatcher:
                 self._defer(r, "中断したので次の機会にやり直す")
         else:
             self.ctx.store.mark_run(f"rule:{r.name}", now)
+        if r.tasks:
+            self._release_memory()
         self.on_change()
         return reports
+
+    def _release_memory(self) -> None:
+        """次のタスクまで要らないもの（重複検出のハッシュ表など）を手放し、常駐中のメモリを小さく保つ。"""
+        self.ctx.store.drop_caches()
+        gc.collect()
 
     def _handle_proposals(self, rep: Report) -> None:
         auto = self.ctx.cfg.get("auto_apply_low_risk", False)
@@ -326,7 +365,7 @@ class Dispatcher:
             "running": f"{self.running.name}:{self.running_task}" if self.running else None,
             "queued": self.runner.queued(),
             "deferred": sorted(self.deferred),
-            "idle_in_s": None if self.idle_due is None else max(0, round(self.idle_due - self.clock())),
+            "idle_at": self.idle_due,   # 状態ファイルは変化時しか書かないので、残り秒ではなく時刻を書く
             "recent_events": self.recent,
             "rules": [{"name": r.name, "on": r.on, "enabled": r.enabled, "tasks": list(r.tasks),
                        "last_run": self.ctx.store.last_run(f"rule:{r.name}") or None} for r in self.rules],
@@ -379,25 +418,41 @@ def run_forever(ctx: TaskContext, dispatcher: Dispatcher, poll: bool = False,
     3 回続けて失敗したらポーリングに切り替える。"""
     probe = DeviceProbe(ctx.transport)
     failures = reconnects = 0
-    if write_status:
-        # ワーカーがタスクを始めた・終えた時にも書く（メインループは最大 60 秒眠るため）
-        dispatcher.on_change = lambda: write_status(dispatcher.status())
+    foreground = needs_foreground(dispatcher.rules)
+    sections = ev.WATCH_SECTIONS + (["focus"] if foreground else [])
+    status_lock = threading.Lock()
+    last_status: list = [None]
+
+    def save_status() -> None:
+        # メインスレッドとワーカーの両方から呼ばれる。中身（更新時刻以外）が同じなら書かない
+        if not write_status:
+            return
+        st = dispatcher.status()
+        key = {k: v for k, v in st.items() if k != "updated"}
+        with status_lock:
+            if key == last_status[0]:
+                return
+            last_status[0] = key
+            write_status(st)
+
+    dispatcher.on_change = save_status
     while max_reconnects is None or reconnects <= max_reconnects:
         try:
-            for e in dispatcher.tracker.seed(probe):
+            for e in dispatcher.tracker.seed(probe, sections):
                 dispatcher.handle(e)
             if poll or failures >= max_failures:
-                source = ev.PollingSource(probe, dispatcher.tracker, sleep=sleep)
+                source = ev.PollingSource(probe, dispatcher.tracker, sleep=sleep, sections=sections,
+                                          screen_off_interval_s=POLL_SCREEN_OFF_S)
             else:
-                source = ev.LogcatSource(ctx.transport, dispatcher.tracker)
+                source = ev.LogcatSource(ctx.transport, dispatcher.tracker, foreground=foreground)
             q: queue.Queue = queue.Queue()
             threading.Thread(target=_pump, args=(source, q), name="jarvis-events", daemon=True).start()
             while True:
-                if write_status:
-                    write_status(dispatcher.status())
+                save_status()
+                # タイマーが無ければ次のイベントまで眠り続ける（定期的に起きない）
                 timeout = dispatcher.next_timer_in(dispatcher.clock())
                 try:
-                    item = q.get(timeout=60 if timeout is None else min(timeout, 60))
+                    item = q.get(timeout=timeout)
                 except queue.Empty:
                     item = None
                 if isinstance(item, Exception):
@@ -414,6 +469,9 @@ def run_forever(ctx: TaskContext, dispatcher: Dispatcher, poll: bool = False,
             wait = min(300, 5 * 2 ** failures)
             dispatcher.log(f"接続エラー（{failures} 回目、{wait}秒後に再接続）: {ex}")
             sleep(wait)
+
+
+POLL_SCREEN_OFF_S = 600   # ポーリング時、画面 OFF 中の間隔（ルールは screen_idle を待つので遅れても困らない）
 
 
 def write_status_file(path: str) -> Callable[[dict], None]:

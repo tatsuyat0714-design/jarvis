@@ -131,6 +131,9 @@ class EventsTest(unittest.TestCase):
         tr.seed(DeviceProbe(t))  # fixture: 画面 ON・USB 給電中
         self.assertEqual([e.kind for e in ev.LogcatSource(t, tr).events()], [ev.SCREEN_OFF])
         self.assertIn("logcat -b events", t.calls[-1])
+        self.assertIn("resume_activity", ev.logcat_cmd(True))
+        self.assertNotIn("resume_activity", ev.logcat_cmd(False))
+        self.assertIn("battery_level", ev.logcat_cmd(False))
 
     def test_polling_backs_off_when_screen_off(self):
         outputs = [DEV, DEV.replace("mWakefulness=Awake", "mWakefulness=Asleep")]

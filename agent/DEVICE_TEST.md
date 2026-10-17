@@ -466,7 +466,7 @@ python -m jarvis_agent pending
 ## ステップ 10. 常駐（daemon）
 
 ```sh
-termux-wake-lock
+termux-wake-unlock   # ステップ 6 で取った wake lock を放す（daemon はタスクの実行中だけ自分で取る）
 python -m jarvis_agent daemon
 ```
 
@@ -499,6 +499,10 @@ python -m jarvis_agent status
 - [ ] 2 回目の screen_idle では optimize が **動かない**（6 時間のクールダウン）
 - [ ] daemon を動かしたまま、別のセッションでもう一度 `daemon` を起動すると「既に動いています」で止まる
 - [ ] 30 分ほど放置したときの電池の減り（設定 → 電池 で Termux の使用量を見る）
+- [ ] 画面 OFF のまま 10 分以上置いてから画面を点けたとき、daemon が止まらずにイベントを受け取る
+  （待機中は端末がスリープするので、screen_idle などは端末が次に起きた時にまとめて処理される。遅れた時間を記録する）
+- [ ] タスクの実行中だけ Termux の通知に「wake lock held」が出て、終わると消える
+- [ ] （比較用・任意）`~/.jarvis/config.json` に `"wake_lock": "always"` を書いて同じ 30 分の電池の減りを測る
 - [ ] Wi-Fi を一度 OFF → ON にしたとき、`接続エラー（N 回目、…秒後に再接続）` のあと復帰するか
   （ワイヤレスデバッグは Wi-Fi OFF で切れるので、復帰には再度 `connect` が必要な場合がある。挙動を記録する）
 
@@ -514,7 +518,6 @@ python -c "import json,pathlib; p=pathlib.Path.home()/'.jarvis/state.json'; d=js
 mkdir -p ~/.termux/boot
 cat > ~/.termux/boot/jarvis-agent <<'EOF'
 #!/data/data/com.termux/files/usr/bin/sh
-termux-wake-lock
 cd ~/jarvis/agent && python -m jarvis_agent daemon >> ~/.jarvis/daemon.log 2>&1
 EOF
 chmod +x ~/.termux/boot/jarvis-agent
