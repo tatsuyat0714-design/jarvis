@@ -1,24 +1,23 @@
 package com.tatsuya.jarvis;
 
-import android.content.Context;
-import android.media.AudioAttributes;
-import android.media.AudioFormat;
-import android.media.AudioTrack;
-import android.os.Bundle;
-import android.os.Handler;
-import android.speech.tts.TextToSpeech;
-import android.speech.tts.UtteranceProgressListener;
-
-import java.io.File;
-import java.nio.file.Files;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Executor;
 
 /**
- * 読み上げ。調声の値（VoiceFx.Params）に応じて 2 通りで鳴らす。
- * - 加工が要らない: TextToSpeech でそのまま話す（速い）。文の間を空けるときは文ごとに区切って無音を挟む
- * - 加工が要る   : 文ごとに WAV へ書き出し → つなぐ → VoiceFx で加工 → AudioTrack で鳴らす
- *   加工に失敗したら（WAV が読めない等）そのまま話す方に切り替える。
- * 話し始め・話し終わりは Listener に 1 回ずつ通知する（会話モードの「次を聞き取る」の合図になるため）。
- * 呼び出しはすべてメインスレッドから。
+ * 読み上げの進行役。1 回の返事を「セッション」として扱い、文が届くたびにすぐ話し始める（AI の返事を待ち切らない）。
+ *   begin() → append(文) を何度でも → finish()
+ * 調声の値（VoiceFx.Params）に応じて 2 通りで鳴らす。
+ * - 加工が要らない: 文ごとに読み上げエンジンの待ち行列へ入れる（届いた文から順に話す）
+ * - 加工が要る   : 文ごとに音声を書き出し → VoiceFx で加工 → 出力（ストリーム）へ流す。
+ *                  1 文目を鳴らしている間に 2 文目を書き出すので、加工しても待ち時間は 1 文分だけ。
+ *   加工に失敗したら、その文から先は（流した分が鳴り終わってから）加工せずに話す。
+ * 話し始め・話し終わりは Listener にセッションごと 1 回ずつ通知する（会話モードの「次を聞き取る」の合図）。
+ * 話し終わりは finish() の後、最後の音が鳴り終わってから。
+ *
+ * Android の部品（TextToSpeech・AudioTrack）は Engine / Output の向こう側（AndroidVoice）にあるので、
+ * この進行役は PC の JUnit でそのまま試せる。呼び出しと通知はすべて 1 本のスレッド（メイン）で行う。
  */
 final class Speaker {
 
@@ -27,190 +26,241 @@ final class Speaker {
         void onEnd();
     }
 
-    private final Context ctx;
-    private final TextToSpeech tts;
-    private final Handler main;
+    /** 読み上げエンジン。結果は Speaker.onUtteranceStart / onUtteranceDone でメインスレッドに返す。 */
+    interface Engine {
+        void setVoice(float rate, float pitch);
+        /** 待ち行列の後ろに足して話す。 */
+        void speak(String text, float volume, String id);
+        void silence(long ms, String id);
+        /** 音声を書き出す（話さない）。始められなければ false。 */
+        boolean synthesize(String text, String id);
+        /** 書き出した音声（WAV）を取り出して消す。別スレッドから呼ぶ。 */
+        byte[] takeAudio(String id);
+        void stop();
+    }
+
+    /** 加工した音を順に鳴らす出力。 */
+    interface Output {
+        int sampleRate();
+        void add(short[] samples);
+        /** これ以上足さない。鳴り終わったら onDone。 */
+        void close();
+        /** すぐ止める（onDone は呼ばない）。 */
+        void cancel();
+    }
+
+    interface OutputFactory {
+        /** onStarted・onDone は別スレッドから呼ばれてよい（Speaker がメインに戻す）。開けなければ null。 */
+        Output open(int sampleRate, int playbackRate, Runnable onStarted, Runnable onDone);
+    }
+
+    private final Engine engine;
+    private final OutputFactory outputs;
+    private final Executor main;       // メインスレッドへ戻す
+    private final Executor fxWorker;   // 加工（順番どおり 1 本で）
     private final Listener listener;
     private VoiceFx.Params params = new VoiceFx.Params();
-    private int gen = 0;              // speak / stop のたびに増やす。古い通知・古い加工結果は捨てる
-    private String[] pending;         // 加工用に書き出し中の文
-    private AudioTrack track;
-    private boolean started;
 
-    Speaker(Context ctx, TextToSpeech tts, Handler main, Listener listener) {
-        this.ctx = ctx;
-        this.tts = tts;
+    // セッションの状態（gen が変わったら古い通知・古い加工結果は捨てる）
+    private int gen = 0;
+    private boolean active, closed, started, ended;
+    private boolean fx;                       // 加工して鳴らすセッションか
+    private VoiceFx.Params sessionParams;
+    // そのまま話す
+    private int issued, done;
+    // 加工して話す
+    private final ArrayDeque<String> toSynth = new ArrayDeque<>();
+    private final List<String> fxTexts = new ArrayList<>();    // 書き出しに回した文（番号順）
+    private int synthesized, processed;
+    private int fxToken;                      // 加工をやめたら増やす（遅れて届いた加工結果を捨てる）
+    private String synthText;                 // 書き出し中の文
+    private final List<String> deferredDirect = new ArrayList<>();   // 加工した音が鳴り終わってから、そのまま話す文
+    private Output output;
+
+    Speaker(Engine engine, OutputFactory outputs, Executor main, Executor fxWorker, Listener listener) {
+        this.engine = engine;
+        this.outputs = outputs;
         this.main = main;
+        this.fxWorker = fxWorker;
         this.listener = listener;
-        tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-            @Override public void onStart(String id) { main.post(() -> onTtsStart(id)); }
-            @Override public void onDone(String id) { main.post(() -> onTtsDone(id, true)); }
-            @Override public void onError(String id) { main.post(() -> onTtsDone(id, false)); }
-        });
     }
 
     void setParams(VoiceFx.Params p) {
         params = p;
-        applyDirect();
+        if (!active || !fx) applyDirect();
     }
 
     VoiceFx.Params params() { return params; }
 
+    boolean isActive() { return active; }
+
+    /** 文章をまとめて話す。 */
     void speak(String text) {
-        stop();
-        String[] ss = VoiceFx.sentences(text == null ? "" : text);
-        if (ss.length == 0) { listener.onEnd(); return; }
+        begin();
         // 文の間を空けないなら 1 つのまま渡す（文をまたいだ抑揚を崩さない）
-        if (params.pauseMs < 1f) ss = new String[]{String.join(" ", ss)};
-        started = false;
-        if (params.needsProcessing()) synthesize(ss, 0);
-        else speakDirect(ss);
+        if (params.pauseMs < 1f) append(text);
+        else for (String s : VoiceFx.sentences(text == null ? "" : text)) append(s);
+        finish();
+    }
+
+    /** 新しい返事を始める（話している途中のものは止める）。 */
+    void begin() {
+        stop();
+        active = true;
+        closed = started = ended = false;
+        sessionParams = params;
+        fx = params.needsProcessing();
+        issued = done = 0;
+        synthesized = processed = 0;
+        synthText = null;
+        toSynth.clear();
+        fxTexts.clear();
+        deferredDirect.clear();
+    }
+
+    /** 文（または文のかたまり）を足す。届いた順にすぐ話し始める。 */
+    void append(String text) {
+        if (!active || closed || text == null || text.trim().isEmpty()) return;
+        String t = text.trim();
+        if (fx) {
+            toSynth.add(t);
+            synthNext();
+        } else if (output != null) {
+            deferredDirect.add(t);   // 加工した音がまだ鳴っている（途中で加工をやめた）
+        } else {
+            speakDirect(t);
+        }
+    }
+
+    /** もう文は来ない。鳴らし終えたら onEnd。 */
+    void finish() {
+        if (!active || closed) return;
+        closed = true;
+        checkEnd();
     }
 
     void stop() {
         gen++;
-        pending = null;
-        tts.stop();
-        releaseTrack();
+        active = false;
+        toSynth.clear();
+        synthText = null;
+        engine.stop();
+        if (output != null) { output.cancel(); output = null; }
         applyDirect();
-        // 途中でやめた分の書き出しファイルを消す（読み込み中のものは開いたまま読み終えられる）
-        File[] old = ctx.getCacheDir().listFiles((d, n) -> n.startsWith("voice_") && n.endsWith(".wav"));
-        if (old != null) for (File f : old) f.delete();
-    }
-
-    void shutdown() {
-        stop();
-        tts.shutdown();
     }
 
     // ---------------------------------------------------------------- そのまま話す
 
-    private void applyDirect() {
-        tts.setSpeechRate(params.rate);
-        tts.setPitch(params.pitch);
-    }
+    private void applyDirect() { engine.setVoice(params.rate, params.pitch); }
 
-    private void speakDirect(String[] ss) {
+    private void speakDirect(String text) {
         applyDirect();
-        Bundle b = new Bundle();
-        b.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, Math.min(1f, params.gain));
-        for (int i = 0; i < ss.length; i++) {
-            tts.speak(ss[i], i == 0 ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD, b, id("d", i, ss.length));
-            if (i < ss.length - 1 && params.pauseMs >= 1f) {
-                tts.playSilentUtterance((long) params.pauseMs, TextToSpeech.QUEUE_ADD, "s" + gen);
-            }
-        }
+        if (issued > 0 && params.pauseMs >= 1f) engine.silence((long) params.pauseMs, "s" + gen + "_" + issued);
+        engine.speak(text, Math.min(1f, params.gain), "d" + gen + "_" + issued);
+        issued++;
     }
 
     // ---------------------------------------------------------------- 加工して話す
 
-    private void synthesize(String[] ss, int i) {
-        pending = ss;
-        // 声の太さ: 読み上げを 1/f の高さ・速さで作り、f 倍の速さで再生する（途中で試し聞きの値が変わっても毎回合わせる）
-        tts.setSpeechRate(VoiceFx.synthRate(params));
-        tts.setPitch(VoiceFx.synthPitch(params));
-        int r = tts.synthesizeToFile(ss[i], new Bundle(), part(gen, i), id("f", i, ss.length));
-        if (r != TextToSpeech.SUCCESS) fallback();
+    /** 書き出しは 1 文ずつ順番に（読み上げエンジンは同時に 1 つしか書き出せない）。 */
+    private void synthNext() {
+        if (synthText != null || toSynth.isEmpty()) return;
+        synthText = toSynth.poll();
+        // 声の太さ: 読み上げを 1/f の高さ・速さで作り、f 倍の速さで再生する
+        engine.setVoice(VoiceFx.synthRate(sessionParams), VoiceFx.synthPitch(sessionParams));
+        int i = fxTexts.size();
+        fxTexts.add(synthText);
+        if (!engine.synthesize(synthText, "f" + gen + "_" + i)) fallbackToDirect(i);
     }
 
-    private File part(int g, int i) { return new File(ctx.getCacheDir(), "voice_" + g + "_" + i + ".wav"); }
-
-    private void fallback() {
-        String[] ss = pending;
-        pending = null;
-        if (ss == null) return;
-        speakDirect(ss);
-    }
-
-    private void processAndPlay(final int g, final String[] ss) {
+    private void onSynthesized(int i, boolean ok) {
+        if (!ok) { fallbackToDirect(i); return; }
+        final int g = gen, token = fxToken;
+        final VoiceFx.Params p = sessionParams;
+        final String id = "f" + gen + "_" + i;
+        synthText = null;
+        synthesized++;
         applyDirect();
-        final VoiceFx.Params p = params;
-        new Thread(() -> {
-            VoiceFx.Pcm pcm = null;
+        fxWorker.execute(() -> {
             short[] out = null;
+            int rate = 0;
             try {
-                VoiceFx.Pcm[] parts = new VoiceFx.Pcm[ss.length];
-                for (int i = 0; i < ss.length; i++) {
-                    File f = part(g, i);
-                    parts[i] = VoiceFx.readWav(Files.readAllBytes(f.toPath()));
-                    f.delete();
-                }
-                pcm = VoiceFx.join(parts, p.pauseMs);
-                if (pcm != null) out = VoiceFx.process(pcm.samples, pcm.sampleRate, p);
+                VoiceFx.Pcm pcm = VoiceFx.readWav(engine.takeAudio(id));
+                if (pcm != null) { out = VoiceFx.process(pcm.samples, pcm.sampleRate, p); rate = pcm.sampleRate; }
             } catch (Exception | OutOfMemoryError ignored) {}
-            final VoiceFx.Pcm src = pcm;
             final short[] samples = out;
-            main.post(() -> {
-                if (g != gen) return;
-                if (samples == null || samples.length == 0 || !play(samples, src.sampleRate, p)) {
-                    pending = ss;
-                    fallback();
+            final int sr = rate;
+            main.execute(() -> {
+                if (g != gen || token != fxToken) return;
+                if (samples == null || samples.length == 0 || !enqueue(samples, sr, p)) {
+                    fallbackToDirect(i);   // この文から先は加工せずに話す
+                    return;
                 }
+                processed++;
+                checkEnd();
             });
-        }, "jarvis-voice").start();
+        });
+        synthNext();   // 鳴らしている間に次の文を書き出す
     }
 
-    private boolean play(short[] s, int rate, VoiceFx.Params p) {
-        try {
-            AudioTrack t = new AudioTrack.Builder()
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(rate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                    .setBufferSizeInBytes(s.length * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build();
-            if (t.write(s, 0, s.length) != s.length) { t.release(); return false; }
-            t.setPlaybackRate(VoiceFx.playbackRate(rate, p));
+    private boolean enqueue(short[] s, int rate, VoiceFx.Params p) {
+        if (output == null) {
             final int g = gen;
-            t.setNotificationMarkerPosition(s.length);
-            t.setPlaybackPositionUpdateListener(new AudioTrack.OnPlaybackPositionUpdateListener() {
-                @Override public void onMarkerReached(AudioTrack a) { finish(g); }
-                @Override public void onPeriodicNotification(AudioTrack a) {}
-            }, main);
-            track = t;
-            t.play();
-            notifyStart();
-            // 端末によってはマーカーが来ないことがあるので、長さ + 余裕で必ず終わらせる
-            long ms = (long) (1000.0 * s.length / VoiceFx.playbackRate(rate, p)) + 1500;
-            main.postDelayed(() -> finish(g), ms);
-            return true;
-        } catch (Exception e) {
-            releaseTrack();
+            output = outputs.open(rate, VoiceFx.playbackRate(rate, p),
+                    () -> main.execute(() -> { if (g == gen) notifyStart(); }),
+                    () -> main.execute(() -> onOutputDone(g)));
+            if (output == null) return false;
+        } else if (output.sampleRate() != rate) {
             return false;
         }
+        if (processed > 0 && p.pauseMs >= 1f) output.add(new short[Math.round(rate * p.pauseMs / 1000f)]);
+        output.add(s);
+        return true;
     }
 
-    private void finish(int g) {
-        if (g != gen || track == null) return;
-        releaseTrack();
-        listener.onEnd();
-    }
-
-    private void releaseTrack() {
-        if (track == null) return;
-        try { track.stop(); } catch (Exception ignored) {}
-        track.release();
-        track = null;
-    }
-
-    // ---------------------------------------------------------------- 読み上げエンジンからの通知
-
-    private String id(String kind, int i, int n) { return kind + gen + "_" + i + "_" + n; }
-
-    /** id = 種類 + 世代 + "_" + 何文目 + "_" + 全文数。今の世代でなければ null。 */
-    private int[] parse(String id, String kind) {
-        if (id == null || !id.startsWith(kind)) return null;
-        String[] a = id.substring(kind.length()).split("_");
-        try {
-            if (a.length != 3 || Integer.parseInt(a[0]) != gen) return null;
-            return new int[]{Integer.parseInt(a[1]), Integer.parseInt(a[2])};
-        } catch (NumberFormatException e) {
-            return null;
+    /**
+     * 加工できなかった: 番号 from の文から先は加工せずに話す。すでに加工して流した分を鳴らし切ってから話すので、
+     * 順番が入れ替わったり重なったりしない。
+     */
+    private void fallbackToDirect(int from) {
+        List<String> rest = new ArrayList<>(fxTexts.subList(Math.min(from, fxTexts.size()), fxTexts.size()));
+        rest.addAll(toSynth);
+        toSynth.clear();
+        synthText = null;
+        fx = false;
+        fxToken++;
+        synthesized = processed;
+        applyDirect();
+        if (output != null) {
+            deferredDirect.addAll(rest);
+            output.close();   // 鳴り終われば onOutputDone で話す
+        } else {
+            for (String t : rest) speakDirect(t);
         }
+        checkEnd();
+    }
+
+    private void onOutputDone(int g) {
+        if (g != gen) return;
+        output = null;
+        List<String> rest = new ArrayList<>(deferredDirect);
+        deferredDirect.clear();
+        for (String t : rest) speakDirect(t);
+        checkEnd();
+    }
+
+    // ---------------------------------------------------------------- 終わりの判定
+
+    private void checkEnd() {
+        if (!active || !closed || ended) return;
+        boolean directDone = done >= issued;
+        boolean fxDone = synthText == null && toSynth.isEmpty() && processed >= synthesized && deferredDirect.isEmpty();
+        if (!directDone || !fxDone) return;
+        if (output != null) { output.close(); return; }   // 鳴り終わったら onOutputDone からもう一度来る
+        ended = true;
+        active = false;
+        if (!started) { started = true; listener.onStart(); }
+        listener.onEnd();
     }
 
     private void notifyStart() {
@@ -219,20 +269,31 @@ final class Speaker {
         listener.onStart();
     }
 
-    private void onTtsStart(String id) {
-        if (parse(id, "d") != null) notifyStart();
+    // ---------------------------------------------------------------- 読み上げエンジンからの通知（メインスレッド）
+
+    /** id = 種類 + 世代 + "_" + 番号。今の世代でなければ -1。 */
+    private int parse(String id, String kind) {
+        if (id == null || !id.startsWith(kind)) return -1;
+        String[] a = id.substring(kind.length()).split("_");
+        try {
+            if (a.length != 2 || Integer.parseInt(a[0]) != gen) return -1;
+            return Integer.parseInt(a[1]);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
-    private void onTtsDone(String id, boolean ok) {
-        int[] d = parse(id, "d");
-        if (d != null) {
-            if (d[0] == d[1] - 1) listener.onEnd();   // 最後の文が終わったら 1 回だけ
+    void onUtteranceStart(String id) {
+        if (parse(id, "d") >= 0) notifyStart();
+    }
+
+    void onUtteranceDone(String id, boolean ok) {
+        if (parse(id, "d") >= 0) {
+            done++;
+            checkEnd();
             return;
         }
-        int[] f = parse(id, "f");
-        if (f == null || pending == null) return;
-        if (!ok) { fallback(); return; }
-        if (f[0] + 1 < f[1]) synthesize(pending, f[0] + 1);
-        else { String[] ss = pending; pending = null; processAndPlay(gen, ss); }
+        int f = parse(id, "f");
+        if (f >= 0 && synthText != null && f == fxTexts.size() - 1) onSynthesized(f, ok);
     }
 }

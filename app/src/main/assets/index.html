@@ -227,6 +227,11 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <div class="field" style="flex:1"><label>会話モード</label><div class="hint">ジャービスが話し終わったら、自動で次の言葉を聞き取ります。「ありがとう」で終了。</div></div>
       <button class="toggle" id="conv" aria-label="会話モード"></button>
     </div>
+    <div class="row">
+      <div class="field" style="flex:1"><label>じっくり考えて答える</label><div class="hint">難しい質問の答えが良くなることがありますが、返事が数秒遅くなります。ふだんはオフがおすすめです。</div></div>
+      <button class="toggle" id="deep" aria-label="じっくり考えて答える"></button>
+    </div>
+    <div class="hint" id="latency"></div>
     <div class="field">
       <label for="callme">あなたの呼び方</label>
       <input type="text" id="callme" placeholder="ボス">
@@ -250,6 +255,12 @@ const A = window.Android || {
   setVoiceFx(j){ try{ this._fx = JSON.parse(j); localStorage.setItem("j.voice_fx", j); }catch(e){} },
   previewVoiceFx(j){ try{ this._fx = JSON.parse(j); }catch(e){} },
   getVoiceFx(){ try{ return localStorage.getItem("j.voice_fx")||""; }catch(e){ return ""; } }, setVoiceName(){},
+  _n: 0, _closed: true,
+  speakBegin(){ try{ speechSynthesis.cancel(); }catch(e){} this._n = 0; this._closed = false; this._first = true; },
+  speakAppend(t){ try{ const u = new SpeechSynthesisUtterance(t); u.lang = "ja-JP"; u.rate = this._fx.rate || 1; u.pitch = this._fx.pitch || 1;
+    if (this._first){ this._first = false; u.onstart = () => jarvis.onSpeak("start"); }
+    this._n++; u.onend = () => { if (--this._n === 0 && this._closed) jarvis.onSpeak("end"); }; speechSynthesis.speak(u); }catch(e){} },
+  speakEnd(){ this._closed = true; if (this._n === 0) jarvis.onSpeak("end"); },
   wakeInfo(){ return JSON.stringify({ on:false, samples:0, enrolling:0, sens:"0.6", label:"ジャービス", state:"stopped", overlay:false, mic:false }); },
   stopSpeak(){ try{ speechSynthesis.cancel(); }catch(e){} },
   setVoice(){}, listen(){ jarvis.onListenError("unavailable"); }, stopListen(){},
@@ -729,8 +740,68 @@ const hasGroq = () => !!pref("groq_key", "");
 const groqFirst = () => pref("groq_first", "0") === "1";
 const isBusy = r => r.status === 429 || r.status >= 500 || (r.status === 0 && /Timeout/i.test(String(r.error||"")));
 
+/* ===== 返事を流しながら受け取る（最初の文が届いたらすぐ話し始める） ===== */
+const streams = {};
+const canStream = () => !!A.aiStream;
+function streamOnce(provider, model, body, onData){
+  return new Promise(res => {
+    const id = "s" + (++reqSeq);
+    streams[id] = { onData, res, chunks: 0 };
+    A.aiStream(id, provider, model || "", JSON.stringify(body));
+  });
+}
+/* Gemini の流れてくる断片 → 文字（届いたそばから onText）と、履歴に残す parts（関数呼び出し・署名を含む） */
+function geminiCollector(onText){
+  const parts = []; let text = "";
+  return {
+    feed(d){
+      const c = d.candidates && d.candidates[0];
+      for (const p of (c && c.content && c.content.parts) || []){
+        if (p.thought) continue;
+        if (p.functionCall){ parts.push(p); continue; }
+        if (typeof p.text !== "string") continue;
+        text += p.text; if (p.text) onText(p.text);
+        const last = parts[parts.length - 1];
+        if (last && typeof last.text === "string"){ last.text += p.text; if (p.thoughtSignature) last.thoughtSignature = p.thoughtSignature; }
+        else parts.push(Object.assign({}, p));
+      }
+    },
+    result(){
+      const calls = parts.filter(p => p.functionCall).map(p => ({ name:p.functionCall.name, args:p.functionCall.args || {} }));
+      return { calls, content:{ role:"model", parts: parts.length ? parts : [{ text:"" }] }, text: text.trim() };
+    },
+  };
+}
+/* Groq（OpenAI 形式）の流れてくる断片 → 文字と、少しずつ届く関数呼び出しの引数 */
+function groqCollector(onText){
+  let text = ""; const calls = [];
+  return {
+    feed(d){
+      const dl = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+      if (dl.content){ text += dl.content; onText(dl.content); }
+      for (const t of dl.tool_calls || []){
+        const k = t.index ?? calls.length, c = calls[k] || (calls[k] = { name:"", args:"" });
+        if (t.function){ if (t.function.name) c.name += t.function.name; if (t.function.arguments) c.args += t.function.arguments; }
+      }
+    },
+    result(){
+      const cs = calls.filter(Boolean).map(c => { let args = {}; try{ args = JSON.parse(c.args || "{}"); }catch(e){} return { name:c.name, args }; });
+      const content = { role:"model", parts: cs.length ? cs.map(c => ({ functionCall:{ name:c.name, args:c.args } })) : [{ text }] };
+      return { calls: cs, content, text: text.trim() };
+    },
+  };
+}
+// 「じっくり考える」がオフなら Gemini の思考を止める（考える時間のぶん返事が数秒遅れるため）。
+// 思考を止められないモデルは 400 を返すので、覚えておいて次からは付けない
+const deepThink = () => pref("deep_think", "0") === "1";
+function withThinking(model, body){
+  if (deepThink() || pref("nothink_" + model, "") === "x") return body;
+  return Object.assign({}, body, { generationConfig: Object.assign({}, body.generationConfig, { thinkingConfig:{ thinkingBudget: 0 } }) });
+}
+const rejectsThinking = r => r.status === 400 && /think/i.test(String(r.body || ""));
+
 /* Gemini：混雑なら再挑戦 → 軽いモデルへ。Groqが控えているときは粘らずすぐ交代 */
-async function callGemini(body, onRetry){
+async function callGemini(body, onRetry, onText){
   const main = pref("gemini_model", "gemini-flash-latest");
   const plan = hasGroq() ? [main, "gemini-2.5-flash-lite"]
     : [main, main, "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
@@ -738,8 +809,21 @@ async function callGemini(body, onRetry){
   let last;
   for (let i = 0; i < uniq.length; i++){
     if (i > 0){ onRetry && onRetry("gemini", i); await sleep(i === 1 && !hasGroq() ? 1500 : 400); }
-    last = await callGeminiOnce(uniq[i], body);
-    if (last.status === 200) return last;
+    if (canStream() && onText){
+      let col = geminiCollector(onText);
+      last = await streamOnce("gemini", uniq[i], withThinking(uniq[i], body), d => col.feed(d));
+      if (rejectsThinking(last) && !last.chunks){
+        A.setPref("nothink_" + uniq[i], "x");
+        col = geminiCollector(onText);
+        last = await streamOnce("gemini", uniq[i], body, d => col.feed(d));
+      }
+      if (last.status === 200) return Object.assign(last, col.result());
+      if (last.chunks) return last;   // 途中まで話したものは別の回線でやり直さない
+    } else {
+      last = await callGeminiOnce(uniq[i], withThinking(uniq[i], body));
+      if (rejectsThinking(last)){ A.setPref("nothink_" + uniq[i], "x"); last = await callGeminiOnce(uniq[i], body); }
+      if (last.status === 200) return last;
+    }
     if (!(isBusy(last) || (last.status === 404 && i >= 1))) return last;
   }
   return last;
@@ -766,36 +850,48 @@ function toOpenAI(hist){
 }
 
 /* 1往復ぶん頭脳に聞く。どちらの会社の返事も同じ形 {calls, content, text} にそろえる */
-async function oneRound(state, onRetry){
+async function oneRound(state, onRetry, onText){
   const tryGroq = async () => {
-    const r = await callGroqOnce({ model: pref("groq_model", "openai/gpt-oss-120b"), messages: toOpenAI(history), tools: groqTools, temperature: 0.7, reasoning_effort: "low" });
+    const body = { model: pref("groq_model", "openai/gpt-oss-120b"), messages: toOpenAI(history), tools: groqTools, temperature: 0.7,
+      reasoning_effort: deepThink() ? "medium" : "low" };
+    if (canStream()){
+      const col = groqCollector(onText);
+      const r = await streamOnce("groq", "", Object.assign({ stream: true }, body), d => col.feed(d));
+      if (r.status !== 200) return { error: r, provider:"groq", chunks: r.chunks };
+      return col.result();
+    }
+    const r = await callGroqOnce(body);
     if (r.status !== 200) return { error: r, provider:"groq" };
     let d; try{ d = JSON.parse(r.body); }catch(e){ return { error:{ status:-1 }, provider:"groq" }; }
     const m = (d.choices && d.choices[0] && d.choices[0].message) || {};
     const calls = (m.tool_calls || []).map(t => { let args = {}; try{ args = JSON.parse(t.function.arguments || "{}"); }catch(e){} return { name:t.function.name, args }; });
     const content = { role:"model", parts: calls.length ? calls.map(c => ({ functionCall:{ name:c.name, args:c.args } })) : [{ text: m.content || "" }] };
+    if (m.content) onText(m.content);
     return { calls, content, text: (m.content || "").trim() };
   };
   const tryGemini = async () => {
-    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } }, onRetry);
-    if (r.status !== 200) return { error: r, provider:"gemini" };
+    const r = await callGemini({ systemInstruction:{ parts:[{ text: system() }] }, contents: history, tools, generationConfig:{ temperature:0.8 } }, onRetry, onText);
+    if (r.status !== 200) return { error: r, provider:"gemini", chunks: r.chunks };
+    if (r.calls) return { calls: r.calls, content: r.content, text: r.text };
     let d; try{ d = JSON.parse(r.body); }catch(e){ return { error:{ status:-1 }, provider:"gemini" }; }
     const content = d.candidates && d.candidates[0] && d.candidates[0].content;
     const parts = (content && content.parts) || [];
     const calls = parts.filter(p => p.functionCall).map(p => ({ name:p.functionCall.name, args:p.functionCall.args || {} }));
-    return { calls, content, text: parts.filter(p => p.text && !p.thought).map(p => p.text).join("").trim() };
+    const txt = parts.filter(p => p.text && !p.thought).map(p => p.text).join("").trim();
+    if (txt) onText(txt);
+    return { calls, content, text: txt };
   };
   // この会話ターンで一度Groqに切り替えたら、最後までGroqで
   if (state.provider !== "groq" && hasGemini() && !(groqFirst() && hasGroq())){
     const g = await tryGemini();
-    if (!g.error || !hasGroq() || !(isBusy(g.error) || g.error.status === 404)) return g;
+    if (!g.error || g.chunks || !hasGroq() || !(isBusy(g.error) || g.error.status === 404)) return g;
     state.provider = "groq"; onRetry && onRetry("groq");
     return tryGroq();
   }
   if (hasGroq()){
     state.provider = "groq";
     const q = await tryGroq();
-    if (q.error && hasGemini() && isBusy(q.error)){ state.provider = "gemini"; onRetry && onRetry("gemini-back"); return tryGemini(); }
+    if (q.error && !q.chunks && hasGemini() && isBusy(q.error)){ state.provider = "gemini"; onRetry && onRetry("gemini-back"); return tryGemini(); }
     return q;
   }
   return tryGemini();
@@ -823,17 +919,50 @@ function aiError(r, provider){
 }
 const geminiError = r => aiError(r, "gemini");
 
-async function askAI(text){
+/* 返事を受け取りながら話す係。文の終わり（。！？）まで届いた分から読み上げに回す */
+function makeTalk(){
+  let buf = "", spoken = 0, el = null, begun = false;
+  const t = {
+    onFirst: null,
+    get used(){ return !!el; },
+    push(d){
+      if (!d) return;
+      if (!el){ t.onFirst && t.onFirst(); el = add("j", ""); }
+      buf += d; el.textContent = buf; log.scrollTop = log.scrollHeight;
+      let cut = -1;
+      for (let i = buf.length - 1; i >= spoken; i--) if ("。！？!?\n".includes(buf[i])){ cut = i; break; }
+      // 長い文は読点で区切って先に話し始める（最初の声までの時間を縮める）
+      if (cut < spoken && buf.length - spoken >= 30){ const c = buf.lastIndexOf("、"); if (c > spoken + 10) cut = c; }
+      if (cut >= spoken){ part(buf.slice(spoken, cut + 1)); spoken = cut + 1; }
+    },
+    end(){
+      const rest = buf.slice(spoken); spoken = buf.length;
+      if (rest.trim()) part(rest);
+      if (begun) A.speakEnd(); else { setMode("idle"); jarvis.onSpeak("end"); }
+    },
+  };
+  function part(s){
+    const c = s.replace(/[*#`_>|~]/g, "").replace(/\n+/g, "。").replace(/^[。、\s]+/, "");
+    if (!c.replace(/[。、\s]/g, "")) return;
+    if (!begun){ begun = true; A.speakBegin(); }
+    A.speakAppend(readAs(c));
+  }
+  return t;
+}
+
+async function askAI(text, talk){
   while (history.length > 20 || (history.length && history[0].role !== "user") || (history[0] && history[0].parts.some(p=>p.functionResponse))) history.shift();
   const startLen = history.length;
   history.push({ role:"user", parts:[{ text }] });
   const bubble = add("j thinking", "考え中…");
   setMode("thinking");
+  let gone = false; const drop = () => { if (!gone){ gone = true; bubble.parentElement.remove(); } };
+  talk.onFirst = drop;
   const state = { provider: null };
   const onRetry = (what, n) => { bubble.textContent = what === "groq" ? "混雑中…予備の頭脳（Groq）に切り替えます" : n === 1 ? "混雑中…再接続しています" : "別の回線に切り替えています…"; };
   for (let round = 0; round < 4; round++){
-    const r = await oneRound(state, onRetry);
-    if (r.error){ bubble.parentElement.remove(); history.length = startLen; return aiError(r.error, r.provider); }
+    const r = await oneRound(state, onRetry, d => talk.push(d));
+    if (r.error){ drop(); history.length = startLen; return aiError(r.error, r.provider); }
     if (r.calls.length){
       history.push(r.content);
       const responses = [];
@@ -845,12 +974,12 @@ async function askAI(text){
       history.push({ role:"user", parts: responses });
       continue;
     }
-    bubble.parentElement.remove();
+    drop();
     if (!r.text){ history.length = startLen; return "申し訳ありません、うまく答えがまとまりませんでした。"; }
-    history.push({ role:"model", parts:[{ text: r.text }] });
-    return r.text;
+    history.push(r.content && r.content.parts && r.content.parts.some(p => p.thoughtSignature) ? r.content : { role:"model", parts:[{ text: r.text }] });
+    return { text: r.text, streamed: true };
   }
-  bubble.parentElement.remove(); history.length = startLen;
+  drop(); history.length = startLen;
   return "手順が込み入ってしまいました。もう少し簡単に言い直していただけますか。";
 }
 
@@ -859,6 +988,7 @@ let busy = false;
 async function handle(text, voice){
   text = (text||"").trim(); if (!text || busy) return;
   viaVoice = !!voice; endConv = false;
+  if (!voice || !latT0) latT0 = Date.now();
   A.stopSpeak();
   add("you", text); q.value = "";
   let r = local(text);
@@ -874,19 +1004,27 @@ async function handle(text, voice){
     return;
   }
   busy = true;
-  try{ say(await askAI(text)); } finally { busy = false; }
+  const talk = makeTalk();
+  try{
+    const r = await askAI(text, talk);
+    if (r && r.streamed) talk.end();                       // 届いたそばから話してある
+    else if (talk.used){ talk.push("\n" + r); talk.end(); }   // 途中まで話したあとのお詫びなど
+    else say(r);
+  } finally { busy = false; }
 }
 
 /* ===== Java からの呼び出し口 ===== */
+let latT0 = 0, lastLatency = 0;
 window.jarvis = {
   onSpeak(s){
+    if (s === "start" && latT0){ lastLatency = Date.now() - latT0; latT0 = 0; }
     if (s === "start") setMode("speaking");
     else { if (mode === "speaking") setMode("idle");
       if (s === "end" && viaVoice && cfg.conv && !endConv && !busy) setTimeout(() => { if (mode === "idle") startListen(); }, 350);
       else if (s === "end") maybeGoBack();
     }
   },
-  onListen(s){ if (s === "ready") setMode("listening"); if (s === "end" && mode === "listening") setMode("thinking"); },
+  onListen(s){ if (s === "ready") setMode("listening"); if (s === "end"){ latT0 = Date.now(); if (mode === "listening") setMode("thinking"); } },
   onLevel(v){ level = Math.max(0, Math.min(1, (v + 2) / 12)); },
   onPartial(t){ q.value = t; },
   onHeard(t){ q.value = ""; setMode("idle"); if (t) handle(t, true); },
@@ -897,6 +1035,8 @@ window.jarvis = {
     if (msg) add("sys", msg);
     // 7=聞き取れず 6=無音タイムアウト → 静かに待機に戻る
   },
+  onAIData(id, data){ const s = streams[id]; if (!s) return; let d; try{ d = JSON.parse(data); }catch(e){ return; } s.chunks++; try{ s.onData(d); }catch(e){} },
+  onAIDone(id, json){ const s = streams[id]; delete streams[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (s){ r.chunks = s.chunks; s.res(r); } },
   onGemini(id, json){ const f = waiting[id]; delete waiting[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (f) f(r); },
   onAssist(quick){ quickCall = !!quick; if (mode !== "listening") startListen(); },
   onWakeSample(ok, why, n){ jarvisWake.sample(ok, why, n); },
@@ -982,6 +1122,8 @@ function openSheet(){
   $("#dict").value = pref("voice_dict", ""); $("#fxCode").value = "";
   $("#callme").value = pref("callme","");
   $("#conv").classList.toggle("on", cfg.conv);
+  $("#deep").classList.toggle("on", deepThink());
+  $("#latency").textContent = lastLatency ? `前回の返事: 話し終わりから声が出るまで ${(lastLatency / 1000).toFixed(1)} 秒` : "";
   $("#gfirst").classList.toggle("on", groqFirst());
   $("#city").value = pref("city","");
   syncResidentUI(); syncWakeUI();
@@ -1021,6 +1163,7 @@ function closeSheet(save){
     A.setPref("city", city);
     const vn = $("#voice").value; if (vn !== "__none") A.setVoiceName && A.setVoiceName(vn);
     A.setPref("conv", $("#conv").classList.contains("on") ? "1" : "0");
+    A.setPref("deep_think", $("#deep").classList.contains("on") ? "1" : "0");
     add("sys", "設定を保存しました");
   } else {
     // 保存せずに閉じたら、試し聞きで変えた声を元に戻す
@@ -1033,6 +1176,7 @@ function closeSheet(save){
 $("#setBtn").onclick = openSheet;
 $("#saveSet").onclick = () => closeSheet(true);
 $("#conv").onclick = e => e.currentTarget.classList.toggle("on");
+$("#deep").onclick = e => e.currentTarget.classList.toggle("on");
 $("#gfirst").onclick = e => e.currentTarget.classList.toggle("on");
 function syncResidentUI(){
   const res = A.isResident ? A.isResident() : false, orb = A.isOrb ? A.isOrb() : true, can = A.canOverlay ? A.canOverlay() : false;
