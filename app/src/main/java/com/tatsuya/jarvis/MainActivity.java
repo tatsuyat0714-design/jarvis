@@ -25,7 +25,6 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
-import android.speech.tts.UtteranceProgressListener;
 import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
@@ -64,6 +63,7 @@ public class MainActivity extends Activity {
 
     private WebView web;
     private TextToSpeech tts;
+    private Speaker speaker;
     private boolean ttsReady = false;
     private SpeechRecognizer recognizer;
     private SharedPreferences prefs;
@@ -101,13 +101,11 @@ public class MainActivity extends Activity {
                 int r = tts.setLanguage(Locale.JAPAN);
                 ttsReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED;
                 applyVoiceName(prefs.getString("voice_name", ""));
-                tts.setPitch(prefs.getFloat("pitch", 0.85f));
-                tts.setSpeechRate(prefs.getFloat("rate", 1.0f));
-                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                    @Override public void onStart(String id) { js("jarvis.onSpeak('start')"); }
-                    @Override public void onDone(String id) { js("jarvis.onSpeak('end')"); }
-                    @Override public void onError(String id) { js("jarvis.onSpeak('end')"); }
+                speaker = new Speaker(this, tts, main, new Speaker.Listener() {
+                    @Override public void onStart() { js("jarvis.onSpeak('start')"); }
+                    @Override public void onEnd() { js("jarvis.onSpeak('end')"); }
                 });
+                speaker.setParams(loadVoiceFx());
             }
         });
     }
@@ -148,7 +146,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (tts != null) { tts.stop(); tts.shutdown(); }
+        if (speaker != null) speaker.shutdown();
+        else if (tts != null) { tts.stop(); tts.shutdown(); }
         if (recognizer != null) recognizer.destroy();
         super.onDestroy();
     }
@@ -172,7 +171,7 @@ public class MainActivity extends Activity {
             js("jarvis.onListenError('unavailable')");
             return;
         }
-        if (tts != null) tts.stop();
+        stopSpeaking();
         if (recognizer == null) {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(new RecognitionListener() {
@@ -274,7 +273,22 @@ public class MainActivity extends Activity {
         return best.loadLabel(pm).toString();
     }
 
-    // ---------------- 声の種類 ----------------
+    // ---------------- 声の種類・調声 ----------------
+
+    private void stopSpeaking() {
+        if (speaker != null) speaker.stop();
+        else if (tts != null) tts.stop();
+    }
+
+    /** 保存された調声の値。古い版の「速さ・高さ」だけの設定も引き継ぐ。 */
+    private VoiceFx.Params loadVoiceFx() {
+        VoiceFx.Params p = VoiceFx.Params.fromJson(prefs.getString("voice_fx", ""));
+        if (prefs.getString("voice_fx", "").isEmpty()) {
+            p.rate = prefs.getFloat("rate", p.rate);
+            p.pitch = prefs.getFloat("pitch", p.pitch);
+        }
+        return p;
+    }
 
     private boolean applyVoiceName(String name) {
         if (tts == null || name == null || name.isEmpty()) return false;
@@ -414,20 +428,45 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void speak(String text) {
             main.post(() -> {
-                if (tts == null || !ttsReady) { js("jarvis.onSpeak('end')"); return; }
-                Bundle p = new Bundle();
-                tts.speak(text, TextToSpeech.QUEUE_FLUSH, p, "u" + System.currentTimeMillis());
+                if (speaker == null || !ttsReady) { js("jarvis.onSpeak('end')"); return; }
+                speaker.speak(text);
             });
         }
 
         @JavascriptInterface
-        public void stopSpeak() { main.post(() -> { if (tts != null) tts.stop(); }); }
+        public void stopSpeak() { main.post(MainActivity.this::stopSpeaking); }
 
+        /** 速さと高さだけ変える（古い画面からの呼び出し用）。ほかの調声の値はそのまま */
         @JavascriptInterface
         public void setVoice(float rate, float pitch) {
             prefs.edit().putFloat("rate", rate).putFloat("pitch", pitch).apply();
-            main.post(() -> { if (tts != null) { tts.setSpeechRate(rate); tts.setPitch(pitch); } });
+            main.post(() -> {
+                if (speaker == null) return;
+                VoiceFx.Params p = speaker.params();
+                p.rate = rate;
+                p.pitch = pitch;
+                speaker.setParams(p);
+            });
         }
+
+        /** 調声の値をまとめて設定する（JSON。範囲外の値は端に丸める）。保存して次の読み上げから使う */
+        @JavascriptInterface
+        public void setVoiceFx(String json) {
+            VoiceFx.Params p = VoiceFx.Params.fromJson(json);
+            prefs.edit().putString("voice_fx", json == null ? "" : json)
+                    .putFloat("rate", p.rate).putFloat("pitch", p.pitch).apply();
+            main.post(() -> { if (speaker != null) speaker.setParams(p); });
+        }
+
+        /** 試し聞き用。保存せずに今の声だけ変える（設定画面を保存せず閉じたら保存済みの値で呼び直す） */
+        @JavascriptInterface
+        public void previewVoiceFx(String json) {
+            VoiceFx.Params p = VoiceFx.Params.fromJson(json);
+            main.post(() -> { if (speaker != null) speaker.setParams(p); });
+        }
+
+        @JavascriptInterface
+        public String getVoiceFx() { return prefs.getString("voice_fx", ""); }
 
         @JavascriptInterface
         public void listen() { main.post(MainActivity.this::startListening); }
