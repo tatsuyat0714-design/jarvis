@@ -104,7 +104,7 @@ public class MainActivity extends Activity {
                 int r = tts.setLanguage(Locale.JAPAN);
                 ttsReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED;
                 applyVoiceName(prefs.getString("voice_name", ""));
-                speaker = new Speaker(this, tts, main, new Speaker.Listener() {
+                speaker = AndroidVoice.create(this, tts, main, new Speaker.Listener() {
                     @Override public void onStart() { js("jarvis.onSpeak('start')"); }
                     @Override public void onEnd() { js("jarvis.onSpeak('end')"); }
                 });
@@ -138,6 +138,7 @@ public class MainActivity extends Activity {
         super.onResume();
         visible = true;
         JarvisService.setAppVisible(true);    // 画面が出ている間は画面側がマイクを使う
+        warmUp();
         if ("1".equals(prefs.getString("resident", "0"))) {
             try { JarvisService.start(this); } catch (Exception ignored) {}
         }
@@ -160,8 +161,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (speaker != null) speaker.shutdown();
-        else if (tts != null) { tts.stop(); tts.shutdown(); }
+        if (speaker != null) speaker.stop();
+        if (tts != null) { tts.stop(); tts.shutdown(); }
         if (recognizer != null) recognizer.destroy();
         super.onDestroy();
     }
@@ -206,7 +207,11 @@ public class MainActivity extends Activity {
                 @Override public void onEvent(int t, Bundle b) {}
             });
         }
+        warmUp();   // 話している間に頭脳への接続を作っておく
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        // 話し終わりの判定までの無音を短めに（既定は端末によって 1.5〜2 秒ほど。対応していない認識エンジンは無視する）
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ja-JP");
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
@@ -442,6 +447,90 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    /**
+     * 返事を流しながら受け取る（Server-Sent Events）。届いた data 行ごとに jarvis.onAIData(id, 行) を呼び、
+     * 終わったら jarvis.onAIDone(id, {status, body|error}) を呼ぶ。最初の文が届いた時点で読み上げを始められる。
+     */
+    private void aiStream(final String id, final String provider, final String modelOverride, final String body) {
+        new Thread(() -> {
+            String result;
+            try {
+                boolean groq = "groq".equals(provider);
+                String key = prefs.getString(groq ? "groq_key" : "gemini_key", "");
+                if (key.isEmpty()) throw new Exception("NO_KEY");
+                URL url;
+                if (groq) {
+                    url = new URL("https://api.groq.com/openai/v1/chat/completions");
+                } else {
+                    String model = (modelOverride != null && !modelOverride.isEmpty())
+                            ? modelOverride : prefs.getString("gemini_model", "gemini-flash-latest");
+                    url = new URL("https://generativelanguage.googleapis.com/v1beta/models/"
+                            + URLEncoder.encode(model, "UTF-8") + ":streamGenerateContent?alt=sse");
+                }
+                HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                c.setRequestMethod("POST");
+                c.setConnectTimeout(15000);
+                c.setReadTimeout(45000);   // 流れている間の途切れの上限
+                c.setDoOutput(true);
+                c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                c.setRequestProperty("Accept", "text/event-stream");
+                if (groq) c.setRequestProperty("Authorization", "Bearer " + key);
+                else c.setRequestProperty("x-goog-api-key", key);
+                try (OutputStream os = c.getOutputStream()) { os.write(body.getBytes(StandardCharsets.UTF_8)); }
+                int code = c.getResponseCode();
+                JSONObject wrap = new JSONObject().put("status", code);
+                if (code >= 400) {
+                    wrap.put("body", readAll(c.getErrorStream()));
+                } else {
+                    try (java.io.BufferedReader r = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                        String line;
+                        while ((line = r.readLine()) != null) {
+                            if (!line.startsWith("data:")) continue;
+                            String data = line.substring(5).trim();
+                            if (data.equals("[DONE]")) break;
+                            if (!data.isEmpty()) js("jarvis.onAIData(" + q(id) + "," + q(data) + ")");
+                        }
+                    }
+                }
+                result = wrap.toString();
+            } catch (Exception e) {
+                try {
+                    result = new JSONObject().put("status", 0).put("error", "NO_KEY".equals(e.getMessage()) ? "NO_KEY"
+                            : e.getClass().getSimpleName() + ": " + e.getMessage()).toString();
+                } catch (Exception ignored) { result = "{\"status\":0}"; }
+            }
+            js("jarvis.onAIDone(" + q(id) + "," + q(result) + ")");
+        }).start();
+    }
+
+    private long lastWarm = 0;
+
+    /**
+     * 頭脳への接続を先に作っておく（話している間に）。暗号化の手続き（TLS）に数百 ms かかるので、
+     * 返事を頼むときには作り済みの接続を使い回せるようにする。1 分に 1 回まで。
+     */
+    private void warmUp() {
+        long now = System.currentTimeMillis();
+        if (now - lastWarm < 60000) return;
+        lastWarm = now;
+        final boolean gem = !prefs.getString("gemini_key", "").isEmpty(), grq = !prefs.getString("groq_key", "").isEmpty();
+        new Thread(() -> {
+            if (gem) touch("https://generativelanguage.googleapis.com/");
+            if (grq) touch("https://api.groq.com/");
+        }, "jarvis-warm").start();
+    }
+
+    private static void touch(String u) {
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(5000);
+            int code = c.getResponseCode();
+            readAll(code >= 400 ? c.getErrorStream() : c.getInputStream());   // 読み切ると接続が使い回しに戻る
+        } catch (Exception ignored) {}
+    }
+
     private static String readAll(InputStream is) throws Exception {
         if (is == null) return "";
         ByteArrayOutputStream bo = new ByteArrayOutputStream();
@@ -465,6 +554,25 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void stopSpeak() { main.post(MainActivity.this::stopSpeaking); }
+
+        /** 届いた文から話し始める返事（AI の返事を流しながら読む）: speakBegin → speakAppend… → speakEnd */
+        @JavascriptInterface
+        public void speakBegin() {
+            main.post(() -> { if (speaker != null && ttsReady) speaker.begin(); });
+        }
+
+        @JavascriptInterface
+        public void speakAppend(String text) {
+            main.post(() -> { if (speaker != null && ttsReady) speaker.append(text); });
+        }
+
+        @JavascriptInterface
+        public void speakEnd() {
+            main.post(() -> {
+                if (speaker != null && ttsReady) speaker.finish();
+                else js("jarvis.onSpeak('end')");
+            });
+        }
 
         /** 速さと高さだけ変える（古い画面からの呼び出し用）。ほかの調声の値はそのまま */
         @JavascriptInterface
@@ -554,6 +662,15 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void groq(String id, String body) { aiRequest(id, "groq", "", body); }
+
+        /** 返事を流しながら受け取る（provider: gemini / groq） */
+        @JavascriptInterface
+        public void aiStream(String id, String provider, String model, String body) {
+            MainActivity.this.aiStream(id, provider, model, body);
+        }
+
+        @JavascriptInterface
+        public void warmUp() { main.post(MainActivity.this::warmUp); }
 
         @JavascriptInterface
         public String getPref(String k) { return prefs.getString(k, ""); }
