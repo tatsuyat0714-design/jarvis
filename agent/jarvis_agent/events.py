@@ -27,10 +27,21 @@ APP_FOREGROUND = "app_foreground"
 SCREEN_IDLE = "screen_idle"
 EVENT_KINDS = (SCREEN_ON, SCREEN_OFF, SCREEN_IDLE, CHARGING_START, CHARGING_STOP, BATTERY_LOW, APP_FOREGROUND)
 
-# 必要なタグ以外は端末側で捨てる（*:S）。-T に端末の現在時刻を渡し、過去ログを流さず「今から」を読む
-LOGCAT_CMD = ("logcat -b events -v brief -T \"$(date '+%m-%d %H:%M:%S.000')\" "
-              "screen_toggled:I battery_status:I battery_level:I "
-              "wm_resume_activity:I am_resume_activity:I '*:S'")
+
+def logcat_cmd(foreground: bool = True) -> str:
+    """必要なタグ以外は端末側で捨てる（*:S）。-T に端末の現在時刻を渡し、過去ログを流さず「今から」を読む。
+    foreground=False ならアプリ切り替え（1 日に数百回出る）のタグを読まない。ルールが使わない限り daemon はこちら。"""
+    tags = "screen_toggled:I battery_status:I battery_level:I "
+    if foreground:
+        tags += "wm_resume_activity:I am_resume_activity:I "
+    return f"logcat -b events -v brief -T \"$(date '+%m-%d %H:%M:%S.000')\" {tags}'*:S'"
+
+
+LOGCAT_CMD = logcat_cmd()
+
+# 常駐の監視に要る最小限のセクション。focus（dumpsys activity / window）は端末側で重いので、
+# アプリ切り替えを使うルールが無い限り取らない
+WATCH_SECTIONS = ["battery", "power"]
 
 # I/battery_status( 1234): [2,2,1,2,Li-ion]
 _LINE = re.compile(r"^[VDIWE]/(\w+)\(\s*\d+\):\s*(.*)$")
@@ -91,9 +102,9 @@ class StateTracker:
                            level=snap.get("battery", "level"), package=snap.get("focus", "package"),
                            temp_c=snap.get("battery", "temp_c"))
 
-    def seed(self, probe: DeviceProbe) -> list[Event]:
+    def seed(self, probe: DeviceProbe, sections: list[str] | None = None) -> list[Event]:
         """端末の今の状態を読み込む。前に知っていた状態との差（切断中に起きた変化）をイベントで返す。"""
-        return self.update_from(probe.snapshot(DeviceProbe.FAST, force=True))
+        return self.update_from(probe.snapshot(sections or DeviceProbe.FAST, force=True))
 
 
 def parse_logcat_line(line: str) -> dict | None:
@@ -122,12 +133,13 @@ def parse_logcat_line(line: str) -> dict | None:
 
 
 class LogcatSource:
-    def __init__(self, transport: Transport, tracker: StateTracker):
+    def __init__(self, transport: Transport, tracker: StateTracker, foreground: bool = True):
         self.transport = transport
         self.tracker = tracker
+        self.foreground = foreground
 
     def events(self) -> Iterator[Event]:
-        for line in self.transport.stream(LOGCAT_CMD):
+        for line in self.transport.stream(logcat_cmd(self.foreground)):
             upd = parse_logcat_line(line)
             if upd:
                 yield from self.tracker.update(**upd)
@@ -138,18 +150,19 @@ class PollingSource:
 
     def __init__(self, probe: DeviceProbe, tracker: StateTracker, interval_s: float = 60,
                  screen_off_interval_s: float = 300, sleep: Callable[[float], None] = time.sleep,
-                 max_polls: int | None = None):
+                 max_polls: int | None = None, sections: list[str] | None = None):
         self.probe = probe
         self.tracker = tracker
         self.interval_s = interval_s
         self.screen_off_interval_s = screen_off_interval_s
         self.sleep = sleep
         self.max_polls = max_polls
+        self.sections = sections or DeviceProbe.FAST
 
     def events(self) -> Iterator[Event]:
         n = 0
         while self.max_polls is None or n < self.max_polls:
             n += 1
-            yield from self.tracker.update_from(self.probe.snapshot(DeviceProbe.FAST, force=True))
+            yield from self.tracker.update_from(self.probe.snapshot(self.sections, force=True))
             off = self.tracker.state.screen_on is False
             self.sleep(self.screen_off_interval_s if off else self.interval_s)

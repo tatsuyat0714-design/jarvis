@@ -87,7 +87,17 @@ def sha256_file(path: str, limit: int | None = None) -> str:
             h.update(buf)
             if remaining is not None:
                 remaining -= len(buf)
+        _drop_page_cache(f.fileno())
     return h.hexdigest()
+
+
+def _drop_page_cache(fd: int) -> None:
+    """一度しか読まないファイル（動画など）で、使用中のアプリのキャッシュを追い出さないようにする。"""
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
 
 
 def find_duplicates(files: Iterable[FileInfo], cache: dict[str, list] | None = None,

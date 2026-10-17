@@ -12,16 +12,23 @@ import ipaddress
 import json
 import socket
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Iterator, Protocol
 from urllib.parse import urlparse
 
 DEFAULT_URL = "http://127.0.0.1:8080"  # llama-server の既定ポート
 
-# 環境変数の HTTP(S)_PROXY を無視する（ローカル宛てが外に出ないように）
-_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_opener = None
+
+
+def _open(req, timeout: float):
+    """urllib（ssl・email を連れてくる。約 10MB）は初回の推論で読み込む。常駐 daemon は LLM を使わなければ読まない。
+    環境変数の HTTP(S)_PROXY は無視する（ローカル宛てが外に出ないように）。"""
+    global _opener
+    import urllib.request
+    if _opener is None:
+        _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _opener.open(req, timeout=timeout)
 
 
 class LLMError(RuntimeError):
@@ -62,13 +69,16 @@ class LocalLLM:
         self.last = Stats()
 
     def health(self) -> bool:
+        import urllib.error
         try:
-            with _opener.open(self.base_url + "/v1/models", timeout=2) as r:
+            with _open(self.base_url + "/v1/models", timeout=2) as r:
                 return r.status == 200
         except (urllib.error.URLError, socket.timeout, ConnectionError):
             return False
 
     def stream(self, messages: list[dict]) -> Iterator[str]:
+        import urllib.error
+        import urllib.request
         body = json.dumps({
             "model": self.model,
             "messages": messages,
@@ -82,7 +92,7 @@ class LocalLLM:
         self.last = Stats()
         start = time.perf_counter()
         try:
-            resp = _opener.open(req, timeout=self.timeout)
+            resp = _open(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
             raise LLMError(f"HTTP {e.code}: {e.read()[:200]!r}") from e
         except (urllib.error.URLError, socket.timeout, ConnectionError) as e:

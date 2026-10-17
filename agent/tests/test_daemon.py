@@ -16,8 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jarvis_agent import __main__ as cli
 from jarvis_agent import events as ev
 from jarvis_agent import tasks
+from jarvis_agent import daemon
 from jarvis_agent.daemon import (DEFAULT_RULES, DaemonError, Dispatcher, Rule, ThreadRunner, acquire_lock,
-                                 apply_overrides, in_hours, run_forever, write_status_file)
+                                 apply_overrides, in_hours, needs_foreground, run_forever, write_status_file)
 from jarvis_agent.store import Store
 from jarvis_agent.tasks import Report, TaskCancelled, TaskContext, run_task
 from jarvis_agent.transport import FakeTransport
@@ -308,11 +309,13 @@ class LockStatusTest(Base):
         (self.root / "home").mkdir(exist_ok=True)
         write_status_file(str(self.root / "home" / "status.json"))(d.status())
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {"JARVIS_HOME": str(self.root / "home")}), redirect_stdout(out):
+        with mock.patch.dict(os.environ, {"JARVIS_HOME": str(self.root / "home")}), redirect_stdout(out), \
+             mock.patch.object(cli.time, "time", lambda: NOW + 100):
             self.assertEqual(cli.main(["status"]), 0)
         text = out.getvalue()
         self.assertIn("daemon: 動作中", text)
-        self.assertIn("あと 300 秒", text)
+        self.assertIn("最後の変化は 100 秒前", text)
+        self.assertIn("あと 200 秒", text)   # 書いた後に経過した分を差し引く
         self.assertIn("idle-cleanup: screen_idle → optimize", text)
         self.assertIn("screen_off", text)
 
@@ -322,6 +325,131 @@ class LockStatusTest(Base):
             self.store.log({"i": i, "pad": "x" * 20})
         self.assertTrue((self.store.root / "log.jsonl.1").exists())
         self.assertLess((self.store.root / "log.jsonl").stat().st_size, 400)
+
+
+class LightweightTest(Base):
+    """常駐中の負荷: 定期的に起きない・書かない・必要な分だけ読む・タスクの後はメモリを手放す。"""
+
+    def run_daemon(self, rules, stream_lines, poll=False):
+        t = FakeTransport(sectioned(DEVICE_TABLE), stream_lines=stream_lines)
+        ctx = TaskContext(t, self.store, now=NOW)
+        d = Dispatcher(ctx, ev.StateTracker(), rules, notify=lambda a, b: None, log=self.logs.append)
+        statuses, timeouts = [], []
+        real_get = daemon.queue.Queue.get
+
+        def get(q, block=True, timeout=None):
+            timeouts.append(timeout)
+            return real_get(q, block, timeout)
+
+        with mock.patch.object(daemon.queue.Queue, "get", get):
+            run_forever(ctx, d, poll=poll, sleep=lambda s: None, max_reconnects=0, write_status=statuses.append)
+        return t, d, statuses, timeouts
+
+    def test_sleeps_until_event_and_writes_status_only_on_change(self):
+        lines = (["I/screen_toggled( 1): 1"] + ["I/battery_level( 1): [80,4000,300]"] * 5
+                 + ["I/screen_toggled( 1): 0"])
+        t, d, statuses, timeouts = self.run_daemon((), lines)
+        self.assertIsNone(timeouts[0])                  # タイマーが無い間は時間切れなしで待つ
+        self.assertIn(300, [round(x) for x in timeouts if x is not None])  # 画面 OFF 後は idle タイマーまで
+        keys = [{k: v for k, v in s.items() if k != "updated"} for s in statuses]
+        self.assertTrue(all(a != b for a, b in zip(keys, keys[1:])))   # 同じ中身を 2 回書かない
+        self.assertLessEqual(len(statuses), 3)
+        n = len(statuses)
+        d.on_change()   # ワーカーからの通知でも、変化が無ければ書かない
+        d.on_change()
+        self.assertEqual(len(statuses), n)
+        d.tracker.update(level=50)
+        d.on_change()
+        self.assertEqual(len(statuses), n + 1)
+
+    def test_reads_only_needed_tags_and_sections(self):
+        t, *_ = self.run_daemon(DEFAULT_RULES, [])
+        logcat = [c for c in t.calls if c.startswith("logcat")]
+        self.assertTrue(logcat)
+        self.assertNotIn("resume_activity", logcat[0])
+        self.assertFalse(any("dumpsys activity" in c or "/proc/meminfo" in c for c in t.calls))
+        rules = DEFAULT_RULES + (Rule("fg", ev.APP_FOREGROUND, (), 0),)
+        self.assertTrue(needs_foreground(rules))
+        self.assertFalse(needs_foreground(DEFAULT_RULES + (Rule("fg", ev.APP_FOREGROUND, (), 0, enabled=False),)))
+        t, *_ = self.run_daemon(rules, [])
+        self.assertIn("resume_activity", [c for c in t.calls if c.startswith("logcat")][0])
+        self.assertTrue(any("dumpsys activity" in c for c in t.calls))
+
+    def test_polling_uses_light_sections(self):
+        src = ev.PollingSource(mock.Mock(), ev.StateTracker(), sections=ev.WATCH_SECTIONS, sleep=lambda s: None,
+                               max_polls=1)
+        src.probe.snapshot.return_value = mock.Mock(data={}, get=lambda *a: None)
+        list(src.events())
+        self.assertEqual(src.probe.snapshot.call_args.args[0], ["battery", "power"])
+
+    def test_worker_runs_at_lower_priority(self):
+        base = os.getpriority(os.PRIO_PROCESS, 0)
+        got = threading.Event()
+        seen = []
+
+        def job():
+            seen.append(os.getpriority(os.PRIO_PROCESS, threading.get_native_id()))
+            got.set()
+            return []
+        ThreadRunner().submit(job)
+        self.assertTrue(got.wait(5))
+        self.assertEqual(seen[0], min(19, base + daemon.WORKER_NICE))
+
+    def test_releases_hash_cache_after_rule(self):
+        self.store.hashes["/x"] = [1, 2, "h"]
+        d = self.make((Rule("x", ev.SCREEN_IDLE, ("a",), 0),))
+        with self.fake_tasks(a=(lambda c: None, False)):
+            d.handle(ev.Event(ev.SCREEN_IDLE))
+        self.assertIsNone(self.store._hashes)
+
+    def test_wake_lock_only_while_tasks_run(self):
+        calls = []
+        rules = (Rule("x", ev.SCREEN_IDLE, ("a",), 0), Rule("n", ev.SCREEN_ON, (), 0, notify_pending=True))
+        d = self.make(rules, wake_lock=calls.append)
+        held = []
+        with self.fake_tasks(a=(lambda c: held.append(list(calls)), False)):
+            d.handle(ev.Event(ev.SCREEN_IDLE))
+        self.assertEqual(held, [[True]])          # タスクの実行中は取っている
+        self.assertEqual(calls, [True, False])    # 終わったら放す
+        d.handle(ev.Event(ev.SCREEN_ON))          # 通知だけのルールでは取らない
+        self.assertEqual(calls, [True, False])
+
+    def test_wake_lock_released_when_task_fails_or_cancelled(self):
+        calls = []
+        d = self.make((Rule("x", ev.SCREEN_IDLE, ("a", "b"), 0),), wake_lock=calls.append)
+
+        def boom(c):
+            raise RuntimeError("x")
+
+        def cancel(c):
+            raise TaskCancelled()
+        with self.fake_tasks(a=(boom, False), b=(cancel, False)):
+            d.handle(ev.Event(ev.SCREEN_IDLE))
+        self.assertEqual(calls, [True, False])
+
+    def test_wake_lock_mode_never_or_always(self):
+        for mode in ("never", "always"):
+            calls = []
+            self.store.config["wake_lock"] = mode
+            d = self.make((Rule("x", ev.SCREEN_IDLE, ("a",), 0),), wake_lock=calls.append)
+            with self.fake_tasks(a=(lambda c: None, False)):
+                d.handle(ev.Event(ev.SCREEN_IDLE))
+            self.assertEqual(calls, [], mode)   # always は起動時に 1 回取るだけ（CLI 側）
+
+    def test_hashing_drops_page_cache(self):
+        from jarvis_agent import dupes
+        f = self.root / "big.bin"
+        f.write_bytes(b"x" * 1000)
+        with mock.patch.object(dupes.os, "posix_fadvise", create=True) as fa:
+            dupes.sha256_file(str(f))
+        self.assertEqual(fa.call_args.args[1:], (0, 0, dupes.os.POSIX_FADV_DONTNEED))
+
+    def test_daemon_does_not_load_http_client(self):
+        import subprocess
+        code = "import sys, jarvis_agent.__main__; print('urllib.request' in sys.modules)"
+        out = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parent.parent),
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), "False")
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ from . import ui
 from .dupes import sha256_file
 from .agent import Action, Agent, LLMPlanner, PlanError, ScriptedPlanner, StepLog, load_macro
 from .daemon import (DEFAULT_RULES, DaemonError, Dispatcher, ThreadRunner, acquire_lock, apply_overrides,
-                     run_forever, write_status_file)
+                     run_forever, termux_wake_lock, write_status_file)
 from .context import build_messages, render
 from .device import DeviceProbe, build_script
 from .llm import DEFAULT_URL, EchoLLM, LLMError, LocalLLM
@@ -164,14 +164,15 @@ def status_cmd(store: Store) -> int:
         return 1
     alive = _alive(st.get("pid"))
     age = int(time.time() - st.get("updated", 0))
-    print(f"daemon: {'動作中' if alive else '停止'}（pid {st.get('pid')}、{age} 秒前に更新）")
+    # 状態ファイルは変化があった時だけ書かれる（何も起きていない間は古いままで正常）
+    print(f"daemon: {'動作中' if alive else '停止'}（pid {st.get('pid')}、最後の変化は {age} 秒前）")
     d = st.get("device", {})
     onoff = {True: "ON", False: "OFF", None: "?"}
     temp = f"{d.get('temp_c'):.0f}℃" if d.get("temp_c") is not None else "?"
     print(f"端末: 画面 {onoff[d.get('screen_on')]} / 充電 {onoff[d.get('plugged')]} / "
           f"電池 {d.get('level', '?')}% / {temp}")
-    if st.get("idle_in_s") is not None:
-        print(f"あと {st['idle_in_s']} 秒で「使っていない」とみなす")
+    if st.get("idle_at") is not None and alive:
+        print(f"あと {max(0, round(st['idle_at'] - time.time()))} 秒で「使っていない」とみなす")
     print(f"実行中: {st.get('running') or 'なし'} / 待ち: {st.get('queued', 0)} / "
           f"先送り: {', '.join(st.get('deferred', [])) or 'なし'}")
     for r in st.get("rules", []):
@@ -352,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             for w in warnings:
                 print(f"設定の警告: {w}", file=sys.stderr)
             lock = acquire_lock(str(store.root / "daemon.lock"))
+            if store.config.get("wake_lock") == "always":
+                termux_wake_lock(True)
             try:
                 dispatcher = Dispatcher(ctx, ev.StateTracker(), rules, runner=ThreadRunner())
                 run_forever(ctx, dispatcher, poll=args.poll,
