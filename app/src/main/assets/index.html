@@ -73,6 +73,12 @@ input[type=range]{width:100%;accent-color:var(--ice)}
 .btn.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
 .group{display:flex;flex-direction:column;gap:14px;padding:14px;border:1px solid var(--line);border-radius:14px}
 .btns{display:flex;gap:10px}.btns .btn{flex:1}
+.group h3{margin:0;font:700 14px var(--f-body);letter-spacing:.05em;color:var(--ice)}
+.fx{display:flex;flex-direction:column;gap:4px}
+.fx .row label{font-size:12px;color:var(--muted)}
+.fx input[type=number]{width:84px;background:var(--ink);border:1px solid var(--line);border-radius:8px;color:var(--fg);font:14px var(--f-body);padding:5px 8px;text-align:right}
+.fx .hint{font-size:11px;color:var(--muted)}
+.field textarea,.btns input[type=text]{background:var(--ink);border:1px solid var(--line);border-radius:10px;color:var(--fg);font:14px var(--f-body);padding:10px 12px;outline:none;resize:vertical}
 </style>
 </head>
 <body>
@@ -151,19 +157,49 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <input type="text" id="model" placeholder="gemini-flash-latest">
       <div class="hint">ふだんは変更不要です。うまく動かないときだけ変えます。</div>
     </div>
-    <div class="field">
-      <label for="voice">声の種類</label>
-      <select id="voice"></select>
-      <div class="hint">スマホに入っている日本語の声から選べます。選ぶとすぐ試し聞きできます。男性の声が少ないときは、Playストアの「Google音声サービス」を更新し、スマホの設定の「テキスト読み上げ」で日本語の音声データを追加すると増えることがあります。</div>
-      <button class="btn ghost" id="jarvisPreset">ジャービス風に整える（低め・落ち着き）</button>
-    </div>
-    <div class="field">
-      <div class="row"><label>話す速さ</label><span id="rateV"></span></div>
-      <input type="range" id="rate" min="0.6" max="1.6" step="0.05">
-    </div>
-    <div class="field">
-      <div class="row"><label>声の高さ</label><span id="pitchV"></span></div>
-      <input type="range" id="pitch" min="0.5" max="1.5" step="0.05">
+    <div class="group" id="tune">
+      <h3>声の調整（調声）</h3>
+      <div class="field">
+        <label for="voice">元になる声</label>
+        <select id="voice"></select>
+        <div class="hint">スマホに入っている日本語の声から選び、下の項目で自由に作り込めます。声の種類を増やすには、Playストアの「Google音声サービス」を更新し、スマホの設定の「テキスト読み上げ」で日本語の音声データを追加します。</div>
+      </div>
+      <div id="fxList"></div>
+      <div class="hint">「声の太さ」「低音・高音」「機械っぽさ」「エコー」「響き」と、1 を超える音量は、読み上げた音声を加工してから鳴らすため、話し始めが少し遅れます。</div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>動かしたら試し聞き</label></div>
+        <button class="toggle" id="autoPreview" aria-label="動かしたら試し聞き"></button>
+      </div>
+      <div class="field">
+        <label for="sampleText">試し聞きの文</label>
+        <input type="text" id="sampleText" placeholder="お呼びでしょうか、ボス。">
+      </div>
+      <div class="btns">
+        <button class="btn ghost" id="testVoice">試し聞き</button>
+        <button class="btn ghost" id="fxReset">加工なしに戻す</button>
+      </div>
+      <div class="field">
+        <label for="profiles">保存した声</label>
+        <select id="profiles"></select>
+        <div class="btns">
+          <input type="text" id="profName" placeholder="名前を付けて保存" style="flex:1;min-width:0">
+          <button class="btn ghost" id="profSave" style="flex:0 0 auto">保存</button>
+          <button class="btn ghost" id="profDel" style="flex:0 0 auto">削除</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="dict">読み方の辞書</label>
+        <textarea id="dict" rows="4" placeholder="JARVIS=ジャービス&#10;明日=あした"></textarea>
+        <div class="hint">1 行に「書き方=読み方」。読み上げのときだけ置き換えます（画面の文字はそのまま）。</div>
+      </div>
+      <div class="field">
+        <label for="fxCode">声の共有コード</label>
+        <textarea id="fxCode" rows="2" placeholder="ここに書き出し・貼り付け"></textarea>
+        <div class="btns">
+          <button class="btn ghost" id="fxExport">書き出す</button>
+          <button class="btn ghost" id="fxImport">読み込む</button>
+        </div>
+      </div>
     </div>
     <div class="row">
       <div class="field" style="flex:1"><label>会話モード</label><div class="hint">ジャービスが話し終わったら、自動で次の言葉を聞き取ります。「ありがとう」で終了。</div></div>
@@ -179,7 +215,6 @@ input[type=range]{width:100%;accent-color:var(--ice)}
       <div class="hint">市区町村名でOK（例：横浜、札幌、大阪市北区）。</div>
     </div>
     <div class="btns">
-      <button class="btn ghost" id="testVoice">声をテスト</button>
       <button class="btn" id="saveSet">保存して閉じる</button>
     </div>
   </div>
@@ -188,7 +223,11 @@ input[type=range]{width:100%;accent-color:var(--ice)}
 <script>
 /* ===== スマホ機能への橋（PCのブラウザで開いたとき用の代役つき） ===== */
 const A = window.Android || {
-  speak(t){ try{ const u=new SpeechSynthesisUtterance(t); u.lang="ja-JP"; u.onstart=()=>jarvis.onSpeak("start"); u.onend=()=>jarvis.onSpeak("end"); speechSynthesis.speak(u);}catch(e){ jarvis.onSpeak("end"); } },
+  _fx: {},
+  speak(t){ try{ const u=new SpeechSynthesisUtterance(t); u.lang="ja-JP"; u.rate=this._fx.rate||1; u.pitch=this._fx.pitch||1; u.volume=Math.min(1,this._fx.gain||1); u.onstart=()=>jarvis.onSpeak("start"); u.onend=()=>jarvis.onSpeak("end"); speechSynthesis.speak(u);}catch(e){ jarvis.onSpeak("end"); } },
+  setVoiceFx(j){ try{ this._fx = JSON.parse(j); localStorage.setItem("j.voice_fx", j); }catch(e){} },
+  previewVoiceFx(j){ try{ this._fx = JSON.parse(j); }catch(e){} },
+  getVoiceFx(){ try{ return localStorage.getItem("j.voice_fx")||""; }catch(e){ return ""; } }, setVoiceName(){},
   stopSpeak(){ try{ speechSynthesis.cancel(); }catch(e){} },
   setVoice(){}, listen(){ jarvis.onListenError("unavailable"); }, stopListen(){},
   setTimer(){ return false; }, setAlarm(){ return false; }, openApp(){ return ""; }, listApps(){ return "[]"; },
@@ -234,8 +273,109 @@ document.addEventListener("pointerdown", () => { clearTimeout(backTimer); quickC
 function say(text){
   add("j", text);
   const clean = text.replace(/[*#`_>|~]/g, "").replace(/\n+/g, "。");
-  A.speak(clean);
+  A.speak(readAs(clean));
 }
+
+/* ===== 調声 ===== */
+// 項目ごとの範囲。Java 側（VoiceFx.Params）と同じ範囲・既定値にしておく
+const FX = [
+  { k:"rate",    label:"話す速さ",       min:0.3,  max:2.5,  step:0.01, def:1.0 },
+  { k:"pitch",   label:"声の高さ",       min:0.3,  max:2.0,  step:0.01, def:0.85 },
+  { k:"formant", label:"声の太さ",       min:0.75, max:1.35, step:0.01, def:1.0, hint:"小さいほど太く大人っぽく、大きいほど細く若い声（高さは変えずに声の響きだけ変える）" },
+  { k:"bass",    label:"低音",           min:-12,  max:12,   step:0.5,  def:0, unit:"dB" },
+  { k:"treble",  label:"高音（はっきり感）", min:-12, max:12, step:0.5,  def:0, unit:"dB" },
+  { k:"metal",   label:"機械っぽさ",     min:0,    max:1,    step:0.01, def:0 },
+  { k:"echo",    label:"エコー",         min:0,    max:0.8,  step:0.01, def:0 },
+  { k:"echoMs",  label:"エコーの間隔",   min:40,   max:600,  step:10,   def:180, unit:"ms" },
+  { k:"reverb",  label:"響き（部屋の広さ）", min:0,  max:1,   step:0.01, def:0 },
+  { k:"gain",    label:"音量",           min:0.3,  max:2.0,  step:0.01, def:1.0 },
+  { k:"pauseMs", label:"文と文の間",     min:0,    max:1000, step:10,   def:0, unit:"ms" },
+];
+const fxDefaults = () => Object.fromEntries(FX.map(f => [f.k, f.def]));
+function fxClean(o){
+  const out = fxDefaults();
+  for (const f of FX){ const v = Number(o && o[f.k]); if (o && o[f.k] !== undefined && o[f.k] !== "" && isFinite(v)) out[f.k] = Math.min(f.max, Math.max(f.min, v)); }
+  return out;
+}
+/** 保存済みの調声。古い版の「速さ・高さ」だけの設定も引き継ぐ */
+function savedFx(){
+  try{ const j = A.getVoiceFx ? A.getVoiceFx() : ""; if (j) return fxClean(JSON.parse(j)); }catch(e){}
+  return fxClean({ rate: pref("rate_v","1.0"), pitch: pref("pitch_v","0.85") });
+}
+const fxDigits = f => f.step >= 1 ? 0 : f.step >= 0.1 ? 1 : 2;
+function buildFxUI(){
+  const box = $("#fxList"); box.textContent = "";
+  for (const f of FX){
+    const d = document.createElement("div"); d.className = "fx";
+    d.innerHTML = `<div class="row"><label for="fx_${f.k}">${f.label}${f.unit ? `（${f.unit}）` : ""}</label>`
+      + `<input type="number" id="fxn_${f.k}" min="${f.min}" max="${f.max}" step="${f.step}" inputmode="decimal"></div>`
+      + `<input type="range" id="fx_${f.k}" min="${f.min}" max="${f.max}" step="${f.step}">`
+      + (f.hint ? `<div class="hint">${f.hint}</div>` : "");
+    box.append(d);
+    const r = d.querySelector("input[type=range]"), n = d.querySelector("input[type=number]");
+    r.oninput = () => { n.value = Number(r.value).toFixed(fxDigits(f)); fxChanged(false); };
+    r.onchange = () => fxChanged(true);
+    n.onchange = () => { const v = fxClean({ [f.k]: n.value })[f.k]; r.value = v; n.value = v.toFixed(fxDigits(f)); fxChanged(true); };
+  }
+}
+function setFxUI(o){
+  for (const f of FX){ $("#fx_" + f.k).value = o[f.k]; $("#fxn_" + f.k).value = Number(o[f.k]).toFixed(fxDigits(f)); }
+}
+const readFxUI = () => fxClean(Object.fromEntries(FX.map(f => [f.k, $("#fx_" + f.k).value])));
+let previewTimer = null;
+function fxChanged(released){
+  A.previewVoiceFx && A.previewVoiceFx(JSON.stringify(readFxUI()));
+  $("#profiles").value = "";
+  if (released && $("#autoPreview").classList.contains("on")){
+    clearTimeout(previewTimer); previewTimer = setTimeout(previewVoice, 350);
+  }
+}
+const voiceSample = () => $("#sampleText").value.trim() || `お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。システムはすべて正常に稼働しております。`;
+function previewVoice(){
+  A.previewVoiceFx && A.previewVoiceFx(JSON.stringify(readFxUI()));
+  A.speak(readAs(voiceSample(), parseDict($("#dict").value)));
+}
+
+/* 読み方の辞書: 「書き方=読み方」を 1 行ずつ。長い書き方から置き換える（短いものが先に食わないように） */
+function parseDict(text){
+  const out = [];
+  for (const line of (text || "").split(/\n/)){
+    const m = line.match(/^\s*(.+?)\s*(?:=|＝|→)\s*(.*?)\s*$/);
+    if (m && m[1]) out.push([m[1], m[2]]);
+  }
+  return out.sort((a, b) => b[0].length - a[0].length);
+}
+let dictCache = null;
+function readAs(text, dict){
+  dict = dict || dictCache || (dictCache = parseDict(pref("voice_dict", "")));
+  if (!dict.length) return text;
+  // 置き換えた結果をさらに置き換えないよう、1 回の走査で左から順に一致を探す
+  let out = "";
+  for (let i = 0; i < text.length;){
+    const hit = dict.find(([w]) => text.startsWith(w, i));
+    if (hit){ out += hit[1]; i += hit[0].length; } else { out += text[i]; i++; }
+  }
+  return out;
+}
+
+/* 保存した声（名前 → 調声の値と元の声） */
+function profiles(){ try{ const o = JSON.parse(pref("voice_profiles", "{}")); return o && typeof o === "object" ? o : {}; }catch(e){ return {}; } }
+function fillProfiles(sel){
+  const box = $("#profiles"); box.textContent = "";
+  const add1 = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; box.append(o); };
+  add1("", "（選ぶと読み込みます）");
+  Object.keys(profiles()).sort().forEach(n => add1(n, n));
+  box.value = sel || "";
+}
+function applyProfile(p){
+  setFxUI(fxClean(p.fx || p));
+  if (p.voice !== undefined){
+    const has = [...$("#voice").options].some(o => o.value === p.voice);
+    if (has){ $("#voice").value = p.voice; A.setVoiceName && A.setVoiceName(p.voice); }
+  }
+  A.previewVoiceFx && A.previewVoiceFx(JSON.stringify(readFxUI()));
+}
+const currentProfile = () => ({ fx: readFxUI(), voice: $("#voice").value === "__none" ? "" : $("#voice").value });
 
 /* ===== 時刻・数字 ===== */
 const now = () => new Date();
@@ -751,15 +891,18 @@ const sheet = $("#sheet");
 function openSheet(){
   $("#key").value = pref("gemini_key",""); $("#model").value = pref("gemini_model","");
   $("#gkey").value = pref("groq_key","");
-  $("#rate").value = pref("rate_v","1.0"); $("#pitch").value = pref("pitch_v","0.85");
+  setFxUI(savedFx()); openVoice = pref("voice_name", "");
+  $("#autoPreview").classList.toggle("on", pref("auto_preview", "1") === "1");
+  $("#dict").value = pref("voice_dict", ""); $("#fxCode").value = "";
   $("#callme").value = pref("callme","");
   $("#conv").classList.toggle("on", cfg.conv);
   $("#gfirst").classList.toggle("on", groqFirst());
   $("#city").value = pref("city","");
   syncResidentUI();
-  fillVoices();
-  syncRange(); sheet.hidden = false;
+  fillVoices(); fillProfiles();
+  sheet.hidden = false;
 }
+let openVoice = "";
 function fillVoices(){
   const sel = $("#voice"); sel.textContent = "";
   const cur = pref("voice_name", "");
@@ -773,8 +916,6 @@ function fillVoices(){
   });
   if (!list.length) opt("__none", "（声の一覧を取得できませんでした）");
 }
-const voiceSample = () => `お呼びでしょうか、${$("#callme").value.trim() || "ボス"}。システムはすべて正常に稼働しております。`;
-function syncRange(){ $("#rateV").textContent = Number($("#rate").value).toFixed(2); $("#pitchV").textContent = Number($("#pitch").value).toFixed(2); }
 function saveKeys(){
   A.setPref("gemini_key", $("#key").value.trim());
   A.setPref("gemini_model", $("#model").value.trim() || "gemini-flash-latest");
@@ -784,14 +925,20 @@ function saveKeys(){
 function closeSheet(save){
   if (save){
     saveKeys();
-    A.setPref("rate_v", $("#rate").value); A.setPref("pitch_v", $("#pitch").value);
-    A.setVoice(Number($("#rate").value), Number($("#pitch").value));
+    A.setVoiceFx(JSON.stringify(readFxUI()));
+    A.setPref("voice_dict", $("#dict").value); dictCache = null;
+    A.setPref("auto_preview", $("#autoPreview").classList.contains("on") ? "1" : "0");
     A.setPref("callme", $("#callme").value.trim());
     const city = $("#city").value.trim(); if (city !== pref("city","")) A.setPref("geo_cache", "{}");
     A.setPref("city", city);
     const vn = $("#voice").value; if (vn !== "__none") A.setVoiceName && A.setVoiceName(vn);
     A.setPref("conv", $("#conv").classList.contains("on") ? "1" : "0");
     add("sys", "設定を保存しました");
+  } else {
+    // 保存せずに閉じたら、試し聞きで変えた声を元に戻す
+    A.stopSpeak();
+    A.previewVoiceFx && A.previewVoiceFx(JSON.stringify(savedFx()));
+    if (A.setVoiceName && $("#voice").value !== openVoice) A.setVoiceName(openVoice);
   }
   sheet.hidden = true;
 }
@@ -817,12 +964,34 @@ $("#overlayBtn").onclick = () => { A.openOverlaySettings && A.openOverlaySetting
 $("#autoBack").onclick = e => { const on = !e.currentTarget.classList.contains("on"); A.setPref("auto_back", on ? "1" : "0"); e.currentTarget.classList.toggle("on", on); };
 $("#assistBtn").onclick = () => { add("sys", "開いた画面で「デフォルトのアシスタントアプリ」→「ジャービス」を選んでください。"); A.openAssistantSettings && A.openAssistantSettings(); };
 document.addEventListener("visibilitychange", () => { if (!document.hidden && !sheet.hidden) syncResidentUI(); });
-$("#rate").oninput = $("#pitch").oninput = syncRange;
-$("#testVoice").onclick = () => { A.setVoice(Number($("#rate").value), Number($("#pitch").value)); A.speak(voiceSample()); };
-$("#voice").onchange = () => { const v = $("#voice").value; if (v === "__none") return; A.setVoiceName && A.setVoiceName(v); A.setVoice(Number($("#rate").value), Number($("#pitch").value)); setTimeout(() => A.speak(voiceSample()), 250); };
-$("#jarvisPreset").onclick = () => {
-  $("#rate").value = "0.95"; $("#pitch").value = "0.8"; syncRange();
-  A.setVoice(0.95, 0.8); A.speak(voiceSample());
+buildFxUI();
+$("#testVoice").onclick = previewVoice;
+$("#voice").onchange = () => { const v = $("#voice").value; if (v === "__none") return; A.setVoiceName && A.setVoiceName(v); $("#profiles").value = ""; setTimeout(previewVoice, 250); };
+$("#autoPreview").onclick = e => e.currentTarget.classList.toggle("on");
+$("#fxReset").onclick = () => { const keep = readFxUI(); setFxUI(fxClean({ rate: keep.rate, pitch: keep.pitch })); fxChanged(true); };
+$("#profiles").onchange = () => {
+  const n = $("#profiles").value; if (!n) return;
+  const p = profiles()[n]; if (!p) return;
+  applyProfile(p); $("#profName").value = n; $("#profiles").value = n;
+  setTimeout(previewVoice, 250);
+};
+$("#profSave").onclick = () => {
+  const n = $("#profName").value.trim(); if (!n){ add("sys", "保存する声の名前を入れてください"); return; }
+  const all = profiles(); all[n] = currentProfile();
+  A.setPref("voice_profiles", JSON.stringify(all)); fillProfiles(n);
+  add("sys", `声「${n}」を保存しました`);
+};
+$("#profDel").onclick = () => {
+  const n = $("#profiles").value || $("#profName").value.trim(); const all = profiles();
+  if (!n || !all[n]){ add("sys", "削除する声を選んでください"); return; }
+  delete all[n]; A.setPref("voice_profiles", JSON.stringify(all)); fillProfiles(); $("#profName").value = "";
+  add("sys", `声「${n}」を削除しました`);
+};
+$("#fxExport").onclick = () => { $("#fxCode").value = JSON.stringify(currentProfile()); $("#fxCode").select(); };
+$("#fxImport").onclick = () => {
+  let p; try{ p = JSON.parse($("#fxCode").value); }catch(e){ p = null; }
+  if (!p || typeof p !== "object"){ add("sys", "共有コードを読み取れませんでした"); return; }
+  applyProfile(p); $("#profiles").value = ""; setTimeout(previewVoice, 250);
 };
 sheet.addEventListener("click", e => { if (e.target === sheet) closeSheet(false); });
 $("#testConn").onclick = async () => {
@@ -940,7 +1109,6 @@ frame();
   const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
   add("j", `${greet}、${cfg.callme}。ホログラムをタップするか、マイクボタンで話しかけてください。`);
   if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiかGroqのAPIキーを登録してください。");
-  A.setVoice(Number(pref("rate_v","1.0")), Number(pref("pitch_v","0.85")));
 })();
 </script>
 </body>

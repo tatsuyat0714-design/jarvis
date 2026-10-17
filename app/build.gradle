@@ -44,3 +44,9 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    // VoiceFx（調声）の単体テスト用。Android の org.json は単体テストでは中身が空なので本物を使う
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20231013'
+}
