@@ -331,7 +331,31 @@ function fxClean(o){
   for (const f of FX){ const v = Number(o && o[f.k]); if (o && o[f.k] !== undefined && o[f.k] !== "" && isFinite(v)) out[f.k] = Math.min(f.max, Math.max(f.min, v)); }
   return out;
 }
-/** 保存済みの調声。古い版の「速さ・高さ」だけの設定も引き継ぐ */
+/*
+ * 初期設定の声（「保存した声」にいつも出て、消せない）。落ち着いた執事の話し方を音声の特徴（やや低めで、
+ * 高音を抑えた柔らかい音、少しゆっくり、文の間を取る、ほんのり機械的な響き）から合わせたもの。
+ * 元になる声は男性の声があればそれを使う（voice:"male"）
+ */
+const DEFAULT_PROFILE_NAME = "ジャービス（初期設定）";
+const DEFAULT_PROFILE = { fx:{ rate:0.95, pitch:0.9, formant:0.92, bass:2, treble:-3, metal:0.12, echo:0, echoMs:180, reverb:0.15, gain:1.1, pauseMs:150 }, voice:"male" };
+/** 端末の日本語の声から男性の声を探す（Google の声は名前に jac / jad が入るものが男性） */
+function maleVoice(){
+  let list = []; try{ list = JSON.parse(A.listVoices ? A.listVoices() : "[]"); }catch(e){}
+  const m = list.filter(v => /x-ja[cd]\b|x-ja[cd]-/.test(v.name)).sort((a, b) => (a.network - b.network) || a.name.localeCompare(b.name));
+  return m.length ? m[0].name : null;
+}
+/** 声をまだ一度も変えていなければ、初期設定の声にする（起動時に呼ぶ。声の一覧の準備が遅いときは少し後でもう一度） */
+function applyDefaultVoiceOnce(){
+  if (pref("voice_init", "") === "1") return;
+  // 自分（この関数）が入れた初期値は「変えた」に数えない
+  const fxMine = pref("voice_init_fx", "") === "1" || !(A.getVoiceFx && A.getVoiceFx());
+  const untouched = fxMine && !pref("rate_v", "") && !pref("voice_name", "");
+  if (!untouched){ A.setPref("voice_init", "1"); return; }
+  if (pref("voice_init_fx", "") !== "1"){ A.setVoiceFx(JSON.stringify(fxClean(DEFAULT_PROFILE.fx))); A.setPref("voice_init_fx", "1"); }
+  const v = maleVoice();
+  if (v){ A.setVoiceName && A.setVoiceName(v); A.setPref("voice_init", "1"); }
+}
+/** 保存済みの調声。古い版の「速さ・高さ」だけの設定も引き継ぐ（初めての起動では applyDefaultVoiceOnce が初期設定の声を保存する） */
 function savedFx(){
   try{ const j = A.getVoiceFx ? A.getVoiceFx() : ""; if (j) return fxClean(JSON.parse(j)); }catch(e){}
   return fxClean({ rate: pref("rate_v","1.0"), pitch: pref("pitch_v","0.85") });
@@ -398,12 +422,14 @@ function fillProfiles(sel){
   const box = $("#profiles"); box.textContent = "";
   const add1 = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; box.append(o); };
   add1("", "（選ぶと読み込みます）");
+  add1("__default", DEFAULT_PROFILE_NAME);
   Object.keys(profiles()).sort().forEach(n => add1(n, n));
   box.value = sel || "";
 }
 function applyProfile(p){
   setFxUI(fxClean(p.fx || p));
   if (p.voice !== undefined){
+    if (p.voice === "male") p = Object.assign({}, p, { voice: maleVoice() || "" });
     const has = [...$("#voice").options].some(o => o.value === p.voice);
     if (has){ $("#voice").value = p.voice; A.setVoiceName && A.setVoiceName(p.voice); }
   }
@@ -1203,8 +1229,8 @@ $("#autoPreview").onclick = e => e.currentTarget.classList.toggle("on");
 $("#fxReset").onclick = () => { const keep = readFxUI(); setFxUI(fxClean({ rate: keep.rate, pitch: keep.pitch })); fxChanged(true); };
 $("#profiles").onchange = () => {
   const n = $("#profiles").value; if (!n) return;
-  const p = profiles()[n]; if (!p) return;
-  applyProfile(p); $("#profName").value = n; $("#profiles").value = n;
+  const p = n === "__default" ? DEFAULT_PROFILE : profiles()[n]; if (!p) return;
+  applyProfile(p); $("#profName").value = n === "__default" ? "" : n; $("#profiles").value = n;
   setTimeout(previewVoice, 250);
 };
 $("#profSave").onclick = () => {
@@ -1215,6 +1241,7 @@ $("#profSave").onclick = () => {
 };
 $("#profDel").onclick = () => {
   const n = $("#profiles").value || $("#profName").value.trim(); const all = profiles();
+  if (n === "__default"){ add("sys", "初期設定の声は消せません。値を変えて別の名前で保存できます。"); return; }
   if (!n || !all[n]){ add("sys", "削除する声を選んでください"); return; }
   delete all[n]; A.setPref("voice_profiles", JSON.stringify(all)); fillProfiles(); $("#profName").value = "";
   add("sys", `声「${n}」を削除しました`);
@@ -1341,6 +1368,8 @@ frame();
   const greet = h < 5 ? "夜更かしですね" : h < 11 ? "おはようございます" : h < 18 ? "こんにちは" : "こんばんは";
   add("j", `${greet}、${cfg.callme}。ホログラムをタップするか、マイクボタンで話しかけてください。`);
   if (!cfg.hasKey) add("sys", "会話の頭脳を使うには、右上の「設定」でGeminiかGroqのAPIキーを登録してください。");
+  // 初めての起動では初期設定の声にする（読み上げの準備に数秒かかることがあるので、少し後にも試す）
+  applyDefaultVoiceOnce(); setTimeout(applyDefaultVoiceOnce, 2500); setTimeout(applyDefaultVoiceOnce, 8000);
 })();
 </script>
 </body>
