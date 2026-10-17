@@ -69,6 +69,9 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private final Handler main = new Handler(Looper.getMainLooper());
     private boolean pendingListen = false;
+    private final List<float[][]> wakeEnroll = new ArrayList<>();   // 登録中の呼びかけ（保存するまでメモリだけ）
+    private volatile boolean wakeTesting = false;
+    static volatile boolean visible = false;   // 画面が出ているか（常駐側が呼びかけ待ちを休むかの判断に使う）
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -117,13 +120,24 @@ public class MainActivity extends Activity {
         setIntent(intent);
         if (isCallIntent(intent)) {
             intent.setAction(Intent.ACTION_MAIN);
-            main.postDelayed(() -> js("jarvis.onAssist(true)"), 250);
+            // 画面はもう読み込み済みなので、待たずに聞き取りを始める（呼びかけからの反応を速く）
+            main.postDelayed(() -> js("jarvis.onAssist(true)"), 30);
         }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        wakeTesting = false;
+        visible = false;
+        JarvisService.setAppVisible(false);   // 画面が隠れたら呼びかけ待ちに戻る
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        visible = true;
+        JarvisService.setAppVisible(true);    // 画面が出ている間は画面側がマイクを使う
         if ("1".equals(prefs.getString("resident", "0"))) {
             try { JarvisService.start(this); } catch (Exception ignored) {}
         }
@@ -212,6 +226,7 @@ public class MainActivity extends Activity {
             if (ok && pendingListen) startListening();
             else if (!ok) js("jarvis.onListenError('permission')");
             pendingListen = false;
+            js("jarvis.onMicPermission(" + ok + ")");   // 呼びかけの登録の途中なら続きを促す
         }
     }
 
@@ -271,6 +286,21 @@ public class MainActivity extends Activity {
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(launch);
         return best.loadLabel(pm).toString();
+    }
+
+    private boolean micGranted() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) return true;
+        main.post(() -> requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC));
+        return false;
+    }
+
+    /** 常駐を設定に合わせて開き直す（呼びかけの登録・感度の変更を反映） */
+    private void restartResident() {
+        main.post(() -> {
+            if ("1".equals(prefs.getString("resident", "0"))) {
+                try { JarvisService.start(this); } catch (Exception ignored) {}
+            }
+        });
     }
 
     // ---------------- 声の種類・調声 ----------------
@@ -533,6 +563,123 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void exitApp() { main.post(() -> moveTaskToBack(true)); }
+
+        // ----- 呼びかけ待ち -----
+
+        /** 設定画面に出す状態。JSON: {on, samples, enrolling, sens, label, state, overlay, mic} */
+        @JavascriptInterface
+        public String wakeInfo() {
+            try {
+                return new JSONObject()
+                        .put("on", "1".equals(prefs.getString("wake", "0")))
+                        .put("samples", WakeWord.fromJson(prefs.getString("wake_templates", "")).size())
+                        .put("enrolling", wakeEnroll.size())
+                        .put("sens", prefs.getString("wake_sens", String.valueOf(WakeWord.DEFAULT_SENSITIVITY)))
+                        .put("label", prefs.getString("wake_label", "ジャービス"))
+                        .put("state", JarvisService.wakeState())
+                        .put("overlay", android.provider.Settings.canDrawOverlays(MainActivity.this))
+                        .put("mic", checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                        .toString();
+            } catch (Exception e) {
+                return "{}";
+            }
+        }
+
+        /** 登録をやり直す（録った分を捨てる） */
+        @JavascriptInterface
+        public void wakeEnrollReset() { main.post(wakeEnroll::clear); }
+
+        /** 登録用に 1 回録音する。結果は jarvis.onWakeSample(ok, 理由, 録れた回数) で返す */
+        @JavascriptInterface
+        public void wakeRecord() {
+            if (!micGranted()) { js("jarvis.onWakeSample(false,'permission',0)"); return; }
+            new Thread(() -> {
+                short[] pcm = WakeListener.record(2500);
+                float[][] t = pcm == null ? null : WakeWord.template(pcm);
+                main.post(() -> {
+                    String why = pcm == null ? "mic" : t == null ? "unclear" : "";
+                    if (t != null) wakeEnroll.add(t);
+                    js("jarvis.onWakeSample(" + (t != null) + ",'" + why + "'," + wakeEnroll.size() + ")");
+                });
+            }, "jarvis-enroll").start();
+        }
+
+        /** 録った呼びかけを保存して、呼びかけ待ちを始める。2 回以上必要 */
+        @JavascriptInterface
+        public boolean wakeSave(String label) {
+            if (wakeEnroll.size() < 2) return false;
+            prefs.edit().putString("wake_templates", WakeWord.toJson(wakeEnroll))
+                    .putString("wake_label", label == null || label.trim().isEmpty() ? "ジャービス" : label.trim())
+                    .putString("wake", "1").putString("resident", "1").apply();
+            main.post(wakeEnroll::clear);
+            restartResident();
+            return true;
+        }
+
+        @JavascriptInterface
+        public void setWake(boolean on) {
+            prefs.edit().putString("wake", on ? "1" : "0").apply();
+            if (on) prefs.edit().putString("resident", "1").apply();
+            restartResident();
+        }
+
+        @JavascriptInterface
+        public void setWakeSensitivity(float s) {
+            prefs.edit().putString("wake_sens", String.valueOf(Math.max(0f, Math.min(1f, s)))).apply();
+            restartResident();
+        }
+
+        /**
+         * 反応のテスト（画面を開いたまま最大 seconds 秒）。いちばん近づいた度合い（1 以下で反応）を
+         * jarvis.onWakeTest(近さ, 反応したか, 終わったか) で 0.3 秒ごとに返す
+         */
+        @JavascriptInterface
+        public void wakeTest(int seconds) {
+            List<float[][]> t = WakeWord.fromJson(prefs.getString("wake_templates", ""));
+            if (t.size() < 2 || !micGranted()) { js("jarvis.onWakeTest(-1,false,true)"); return; }
+            float sens = WakeWord.DEFAULT_SENSITIVITY;
+            try { sens = Float.parseFloat(prefs.getString("wake_sens", "")); } catch (Exception ignored) {}
+            WakeWord.Detector d = new WakeWord.Detector(t, WakeWord.threshold(t, sens));
+            wakeTesting = true;
+            new Thread(() -> {
+                android.media.AudioRecord r = WakeListener.open();
+                if (r == null) { js("jarvis.onWakeTest(-1,false,true)"); wakeTesting = false; return; }
+                short[] hop = new short[WakeWord.HOP];
+                long end = System.currentTimeMillis() + Math.max(3, Math.min(30, seconds)) * 1000L, next = 0;
+                boolean hit = false;
+                try {
+                    r.startRecording();
+                    while (wakeTesting && System.currentTimeMillis() < end) {
+                        int n = 0;
+                        while (n < hop.length) { int g = r.read(hop, n, hop.length - n); if (g <= 0) break; n += g; }
+                        if (n < hop.length) break;
+                        hit |= d.push(hop);
+                        if (System.currentTimeMillis() >= next || hit) {
+                            float sc = d.lastScore;
+                            d.lastScore = Float.POSITIVE_INFINITY;
+                            js("jarvis.onWakeTest(" + (Float.isInfinite(sc) ? 9 : sc) + "," + hit + ",false)");
+                            hit = false;
+                            next = System.currentTimeMillis() + 300;
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    try { r.stop(); } catch (Exception ignored) {}
+                    r.release();
+                    wakeTesting = false;
+                    js("jarvis.onWakeTest(9,false,true)");
+                }
+            }, "jarvis-waketest").start();
+        }
+
+        @JavascriptInterface
+        public void wakeTestStop() { wakeTesting = false; }
+
+        @JavascriptInterface
+        public void wakeClear() {
+            prefs.edit().remove("wake_templates").putString("wake", "0").apply();
+            restartResident();
+        }
 
         // ----- 声 -----
         @JavascriptInterface

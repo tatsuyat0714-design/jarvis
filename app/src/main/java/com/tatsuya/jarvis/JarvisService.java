@@ -16,9 +16,17 @@ import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.RadialGradient;
 import android.graphics.Shader;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
@@ -26,10 +34,14 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 
+import java.util.List;
+
 /**
  * ジャービスの常駐係。
  * ・通知欄に「話しかける」ボタン付きの通知を出し続ける
  * ・（許可があれば）他のアプリの上に浮かぶ光の玉を出す。タップで話しかけ、ドラッグで移動、長押しで隠す
+ * ・（オンにしていれば）呼びかけ（「ジャービス」など）を待ち、聞こえたらすぐ聞き取りを始める。
+ *   マイクの音は端末の中だけで調べ、録音もしない。アプリの画面が出ている間は画面側がマイクを使うので休む
  */
 public class JarvisService extends Service {
 
@@ -37,6 +49,18 @@ public class JarvisService extends Service {
     static final String ACTION_STOP = "com.tatsuya.jarvis.STOP";
     static final String ACTION_ORB = "com.tatsuya.jarvis.ORB";   // 光の玉の表示/非表示を設定に合わせて更新
     private static final int NOTIF_ID = 7;
+    private static final int CALL_NOTIF_ID = 8;
+    static final String CALL_CHANNEL = "jarvis_call";
+
+    private static JarvisService instance;
+    private final Handler h = new Handler(Looper.getMainLooper());
+    private List<float[][]> wakeTemplates;
+    private float wakeThreshold;
+    private WakeListener wake;
+    private boolean micBlocked;      // Android 14 以降、後ろから起動されたためマイクを使えない（アプリを開けば直る）
+    private boolean appVisible;      // アプリの画面が出ている（画面側がマイクを使う）
+    private boolean waitingForApp;   // 呼ばれて画面を開いているところ
+    private final Runnable retryWake = this::syncWake;
 
     private WindowManager wm;
     private OrbView orb;
@@ -58,9 +82,32 @@ public class JarvisService extends Service {
         return PendingIntent.getActivity(c, 1, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
+    /** アプリの画面が出た・消えた（MainActivity から）。出ている間は呼びかけ待ちを休む */
+    static void setAppVisible(boolean visible) {
+        JarvisService s = instance;
+        if (s == null) return;
+        s.h.post(() -> {
+            s.appVisible = visible;
+            if (visible) s.waitingForApp = false;
+            s.syncWake();
+        });
+    }
+
+    /** 呼びかけ待ちの状態（設定画面の表示用） */
+    static String wakeState() {
+        JarvisService s = instance;
+        if (s == null) return "stopped";
+        if (s.wake != null) return "listening";
+        if (s.micBlocked) return "blocked";
+        if (s.appVisible) return "paused";
+        return s.wakeWanted() ? "waiting" : "off";
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
+        appVisible = MainActivity.visible;   // 画面を開いたまま常駐を始めたとき
         prefs = getSharedPreferences("jarvis", MODE_PRIVATE);
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
     }
@@ -69,19 +116,41 @@ public class JarvisService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             prefs.edit().putString("resident", "0").apply();
+            stopWake();
             removeOrb();
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
         }
-        Notification n = buildNotification();
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        } else {
-            startForeground(NOTIF_ID, n);
-        }
+        loadWake();
+        startForegroundTyped();
         syncOrb();
+        syncWake();
         return START_STICKY;
+    }
+
+    /**
+     * 呼びかけ待ちをするなら、マイクを使う常駐として開始する。Android 14 以降は、アプリが後ろにいるとき
+     * （再起動直後など）はマイクを使う常駐を始められないので、その場合はマイクなしで始めて、
+     * アプリが開かれたとき（onResume から start が呼ばれる）にやり直す。
+     */
+    private void startForegroundTyped() {
+        boolean wantMic = wakeWanted();
+        micBlocked = false;
+        if (Build.VERSION.SDK_INT >= 34) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+            if (wantMic) {
+                try {
+                    startForeground(NOTIF_ID, buildNotification(), type | ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                    return;
+                } catch (Exception e) {
+                    micBlocked = true;
+                }
+            }
+            startForeground(NOTIF_ID, buildNotification(), type);
+        } else {
+            startForeground(NOTIF_ID, buildNotification());
+        }
     }
 
     private Notification buildNotification() {
@@ -98,9 +167,19 @@ public class JarvisService extends Service {
         PendingIntent openPi = PendingIntent.getActivity(this, 3, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
         Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        String title = "ジャービス 待機中", text = "「話しかける」をタップすると、すぐに聞き取りを始めます";
+        if (wakeWanted()) {
+            String word = prefs.getString("wake_label", "ジャービス");
+            if (micBlocked) {
+                text = "アプリを一度開くと、呼びかけ待ちを再開します";
+            } else {
+                title = "ジャービス 待機中（呼びかけ待ち）";
+                text = "「" + word + "」と呼ぶか、「話しかける」をタップ";
+            }
+        }
         b.setSmallIcon(R.drawable.ic_stat_jarvis)
-                .setContentTitle("ジャービス 待機中")
-                .setContentText("「話しかける」をタップすると、すぐに聞き取りを始めます")
+                .setContentTitle(title)
+                .setContentText(text)
                 .setColor(Color.parseColor("#8FD8FF"))
                 .setOngoing(true)
                 .setShowWhen(false)
@@ -109,6 +188,99 @@ public class JarvisService extends Service {
                 .addAction(new Notification.Action.Builder(null, "常駐をやめる", stopPi).build());
         if (Build.VERSION.SDK_INT >= 31) b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
         return b.build();
+    }
+
+    // ---------------- 呼びかけ待ち ----------------
+
+    private boolean hasMic() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void loadWake() {
+        wakeTemplates = WakeWord.fromJson(prefs.getString("wake_templates", ""));
+        float sens = WakeWord.DEFAULT_SENSITIVITY;
+        try { sens = Float.parseFloat(prefs.getString("wake_sens", "")); } catch (Exception ignored) {}
+        wakeThreshold = wakeTemplates.isEmpty() ? 0 : WakeWord.threshold(wakeTemplates, sens);
+    }
+
+    private boolean wakeWanted() {
+        return "1".equals(prefs.getString("wake", "0")) && wakeTemplates != null && wakeTemplates.size() >= 2 && hasMic();
+    }
+
+    /** 今の状態に合わせて、マイクを開く・閉じる */
+    private void syncWake() {
+        h.removeCallbacks(retryWake);
+        boolean want = wakeWanted() && !micBlocked && !appVisible && !waitingForApp;
+        if (want && wake == null) {
+            // 毎回新しい検出器にする（前回の途中経過を持ち越さない）
+            WakeListener w = new WakeListener(new WakeWord.Detector(wakeTemplates, wakeThreshold), h, new WakeListener.Callback() {
+                @Override public void onWake() { onWakeHeard(); }
+                @Override public void onMicLost() {
+                    wake = null;
+                    h.postDelayed(retryWake, 15000);   // 通話などが終わったら戻れるよう、ときどき開き直す
+                }
+            });
+            if (w.start()) wake = w;
+            else h.postDelayed(retryWake, 15000);
+        } else if (!want) {
+            stopWake();
+        }
+    }
+
+    private void stopWake() {
+        h.removeCallbacks(retryWake);
+        if (wake != null) { wake.stop(); wake = null; }
+    }
+
+    /** 呼びかけが聞こえた: すぐ合図して、画面を開いて聞き取りを始める */
+    private void onWakeHeard() {
+        if (wake == null) return;
+        stopWake();               // 聞き取り（Google の音声認識）にマイクを譲る
+        waitingForApp = true;
+        acknowledge();
+        try {
+            startActivity(new Intent(this, MainActivity.class).setAction(MainActivity.ACTION_LISTEN)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+        } catch (Exception ignored) {}
+        // 画面を開けなかった（後ろからの起動を Android に止められた）ときは、通知で知らせて待ちに戻る
+        h.postDelayed(() -> {
+            if (waitingForApp && !appVisible) {
+                waitingForApp = false;
+                notifyCouldNotOpen();
+                syncWake();
+            }
+        }, 3000);
+    }
+
+    /** 「ピッ」と短い振動。聞こえたことがすぐ分かるように */
+    private void acknowledge() {
+        try {
+            ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_MUSIC, 70);
+            tg.startTone(ToneGenerator.TONE_PROP_ACK, 150);
+            h.postDelayed(tg::release, 400);
+        } catch (Exception ignored) {}
+        try {
+            Vibrator v = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+            if (v != null && v.hasVibrator()) v.vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE));
+        } catch (Exception ignored) {}
+    }
+
+    private void notifyCouldNotOpen() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm.getNotificationChannel(CALL_CHANNEL) == null) {
+            NotificationChannel ch = new NotificationChannel(CALL_CHANNEL, "呼びかけへの応答", NotificationManager.IMPORTANCE_HIGH);
+            ch.setDescription("呼びかけが聞こえたのに画面を開けなかったときに知らせます");
+            nm.createNotificationChannel(ch);
+        }
+        Notification n = new Notification.Builder(this, CALL_CHANNEL)
+                .setSmallIcon(R.drawable.ic_stat_jarvis)
+                .setContentTitle("お呼びでしょうか")
+                .setContentText("タップで話しかけられます。「他のアプリの上に表示」を許可すると、次からすぐ開きます")
+                .setContentIntent(listenIntent(this))
+                .setAutoCancel(true)
+                .setTimeoutAfter(60000)
+                .build();
+        nm.notify(CALL_NOTIF_ID, n);
     }
 
     // ---------------- 浮かぶ光の玉 ----------------
@@ -186,7 +358,9 @@ public class JarvisService extends Service {
 
     @Override
     public void onDestroy() {
+        stopWake();
         removeOrb();
+        if (instance == this) instance = null;
         super.onDestroy();
     }
 

@@ -9,6 +9,9 @@
     <!-- 常駐（通知・浮かぶ光の玉・再起動後の自動復帰） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 呼びかけ待ち（常駐中にマイクで「ジャービス」を聞き分ける。端末の中だけで処理し、録音は保存しない） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -83,10 +86,10 @@
         <service
             android:name=".JarvisService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|microphone">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Personal voice assistant that stays available via a floating button and notification" />
+                android:value="Personal voice assistant that stays available via a floating button, notification and an on-device wake word" />
         </service>
 
         <service
