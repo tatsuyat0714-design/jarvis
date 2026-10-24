@@ -176,7 +176,18 @@ public class MainActivity extends Activity {
 
     // ---------------- 音声認識 ----------------
 
+    // 聞き取りの様子（失敗したときに原因を見分けて、直せるものはその場でやり直す）
+    private boolean heardSpeech;      // 話し始めを認識エンジンが捉えた
+    private boolean listenRetried;    // この聞き取りでやり直し済み
+    private boolean listenFast;       // 「話し終わりの無音を短く」を付けて頼んだ
+    private long listenAt;
+
     private void startListening() {
+        listenRetried = false;
+        beginListening();
+    }
+
+    private void beginListening() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingListen = true;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
@@ -187,15 +198,20 @@ public class MainActivity extends Activity {
             return;
         }
         stopSpeaking();
+        if (wakeTesting) {   // 呼びかけのテストがマイクを開いたままだと、認識エンジンには無音しか届かない
+            wakeTesting = false;
+            main.postDelayed(this::beginListening, 200);
+            return;
+        }
         if (recognizer == null) {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(new RecognitionListener() {
                 @Override public void onReadyForSpeech(Bundle b) { js("jarvis.onListen('ready')"); }
-                @Override public void onBeginningOfSpeech() { js("jarvis.onListen('speech')"); }
+                @Override public void onBeginningOfSpeech() { heardSpeech = true; js("jarvis.onListen('speech')"); }
                 @Override public void onRmsChanged(float v) { js("jarvis.onLevel(" + v + ")"); }
                 @Override public void onBufferReceived(byte[] b) {}
                 @Override public void onEndOfSpeech() { js("jarvis.onListen('end')"); }
-                @Override public void onError(int error) { js("jarvis.onListenError('" + error + "')"); }
+                @Override public void onError(int error) { onListenFailed(error); }
                 @Override public void onResults(Bundle b) {
                     ArrayList<String> r = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                     js("jarvis.onHeard(" + q(r != null && !r.isEmpty() ? r.get(0) : "") + ")");
@@ -209,14 +225,43 @@ public class MainActivity extends Activity {
         }
         warmUp();   // 話している間に頭脳への接続を作っておく
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        // 話し終わりの判定までの無音を短めに（既定は端末によって 1.5〜2 秒ほど。対応していない認識エンジンは無視する）
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L);
+        // 話し終わりの判定までの無音を短めに（既定は端末によって 1.5〜2 秒ほど）。
+        // 認識エンジンによってはこれで話し始める前に打ち切ってしまうので、そうなった端末では付けない（onListenFailed）
+        listenFast = !"1".equals(prefs.getString("listen_plain", "0"));
+        if (listenFast) {
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L);
+        }
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ja-JP");
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        heardSpeech = false;
+        listenAt = System.currentTimeMillis();
         recognizer.startListening(i);
+    }
+
+    /** 聞き取りに失敗した。認識エンジンの不調なら作り直して 1 回だけやり直し、それ以外は画面に原因を出す。 */
+    private void onListenFailed(int error) {
+        boolean quick = System.currentTimeMillis() - listenAt < 2500;
+        if (!listenRetried) {
+            if (error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    || error == 11 /* ERROR_SERVER_DISCONNECTED */) {
+                listenRetried = true;
+                if (recognizer != null) { recognizer.destroy(); recognizer = null; }
+                main.postDelayed(this::beginListening, 300);
+                return;
+            }
+            // 話し始める前にすぐ打ち切られた: 無音の長さの指定が合わない認識エンジン。以後は付けずに聞く
+            if ((error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+                    && !heardSpeech && listenFast && quick) {
+                listenRetried = true;
+                prefs.edit().putString("listen_plain", "1").apply();
+                beginListening();
+                return;
+            }
+        }
+        js("jarvis.onListenError('" + error + "')");
     }
 
     @Override

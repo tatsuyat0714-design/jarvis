@@ -1046,7 +1046,7 @@ window.jarvis = {
     if (s === "start" && latT0){ lastLatency = Date.now() - latT0; latT0 = 0; }
     if (s === "start") setMode("speaking");
     else { if (mode === "speaking") setMode("idle");
-      if (s === "end" && viaVoice && cfg.conv && !endConv && !busy) setTimeout(() => { if (mode === "idle") startListen(); }, 350);
+      if (s === "end" && viaVoice && cfg.conv && !endConv && !busy) setTimeout(() => { if (mode === "idle") startListen(true); }, 350);
       else if (s === "end") maybeGoBack();
     }
   },
@@ -1056,10 +1056,9 @@ window.jarvis = {
   onHeard(t){ q.value = ""; setMode("idle"); if (t) handle(t, true); },
   onListenError(code){
     setMode("idle"); q.value = "";
-    const msg = { permission:"マイクの使用が許可されていません。スマホの設定から、ジャービスにマイクを許可してください。",
-      unavailable:"このスマホでは音声認識が使えないようです。Googleアプリが入っているか確認してください。" }[code];
+    const auto = autoListen; autoListen = false;
+    const msg = listenErrorText(code, auto);
     if (msg) add("sys", msg);
-    // 7=聞き取れず 6=無音タイムアウト → 静かに待機に戻る
   },
   onAIData(id, data){ const s = streams[id]; if (!s) return; let d; try{ d = JSON.parse(data); }catch(e){ return; } s.chunks++; try{ s.onData(d); }catch(e){} },
   onAIDone(id, json){ const s = streams[id]; delete streams[id]; let r; try{ r = JSON.parse(json); }catch(e){ r = { status:0 }; } if (s){ r.chunks = s.chunks; s.res(r); } },
@@ -1072,7 +1071,21 @@ window.jarvis = {
   onBack(){ if (!$("#sheet").hidden){ closeSheet(false); } else A.exitApp(); },
 };
 
-function startListen(){ if (mode === "listening"){ A.stopListen(); return; } A.stopSpeak(); setMode("listening"); A.listen(); }
+// 聞き取りに失敗した理由（SpeechRecognizer のエラー番号）。会話の続きを自動で聞いていて黙っていたときは何も出さない
+function listenErrorText(code, auto){
+  const c = String(code);
+  if (c === "permission") return "マイクの使用が許可されていません。スマホの設定から、ジャービスにマイクを許可してください。";
+  if (c === "unavailable") return "このスマホでは音声認識が使えないようです。Googleアプリが入っているか確認してください。";
+  if (c === "6" || c === "7") return auto ? "" : "聞き取れませんでした。マイクのボタンを押してから、少し大きめの声でどうぞ。";
+  if (c === "9") return "音声認識（Googleアプリ）にマイクの許可がありません。スマホの設定 → アプリ → Google → 権限 で、マイクを許可してください。";
+  if (c === "3") return "マイクの音を受け取れませんでした。通話や録音など、ほかのアプリがマイクを使っていないか確かめてください。";
+  if (c === "1" || c === "2" || c === "4") return "音声認識がネットにつながりませんでした。通信状態を確かめて、もう一度どうぞ。";
+  if (c === "12" || c === "13") return "音声認識が日本語に対応していません。Googleアプリの設定 → 音声 → 言語 で、日本語を追加してください。";
+  return "音声認識がうまく動きませんでした（エラー " + c + "）。もう一度押してみてください。";
+}
+let autoListen = false;   // 会話の続きを自動で聞いている
+function startListen(auto){ if (mode === "listening"){ autoListen = true; A.stopListen(); return; }   // 自分で止めたときは「聞き取れず」を出さない
+  autoListen = auto === true; A.stopSpeak(); setMode("listening"); A.listen(); }
 micBtn.onclick = startListen;
 $("#f").addEventListener("submit", e => { e.preventDefault(); handle(q.value, false); });
 $("#chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) handle(b.textContent, false); });
